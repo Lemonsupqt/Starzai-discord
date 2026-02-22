@@ -164,22 +164,11 @@ class RateLimiter:
         server_id: Optional[int] = None,
         estimated_tokens: int = 0,
     ) -> RateLimitResult:
-        """Check if user/server has remaining daily token budget."""
-        user_used = self._user_tokens.get(user_id, 0)
-        if user_used + estimated_tokens > self.daily_token_limit_user:
-            return RateLimitResult(
-                allowed=False,
-                reason=f"Daily token limit reached ({user_used:,}/{self.daily_token_limit_user:,})",
-            )
-
-        if server_id:
-            server_used = self._server_tokens.get(server_id, 0)
-            if server_used + estimated_tokens > self.daily_token_limit_server:
-                return RateLimitResult(
-                    allowed=False,
-                    reason=f"Server daily token limit reached ({server_used:,}/{self.daily_token_limit_server:,})",
-                )
-
+        """Check if user/server has remaining daily token budget.
+        
+        NOTE: Token limits are disabled - unlimited API usage allowed.
+        """
+        # Token limits disabled - always allow
         return RateLimitResult(allowed=True)
 
     def record_tokens(
