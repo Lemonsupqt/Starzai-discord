@@ -543,8 +543,8 @@ class ChatCog(commands.Cog, name="Chat"):
         messages.extend(conv["messages"])
         
         # Show typing indicator
-        async with message.channel.typing():
-            try:
+        try:
+            async with message.channel.typing():
                 # Stream the response
                 collected = ""
                 reply_msg = None
@@ -559,52 +559,55 @@ class ChatCog(commands.Cog, name="Chat"):
                         if not reply_msg:
                             # Send initial message
                             reply_msg = await message.reply(collected[:2000])
+                            last_edit = now
                         else:
-                            # Update existing message
+                            # Update existing message (ignore errors)
                             try:
-                                await reply_msg.edit(content=collected[:2000])  # Discord limit
+                                await reply_msg.edit(content=collected[:2000])
+                                last_edit = now
                             except discord.HTTPException:
+                                # Edit failed, but don't crash - just skip this update
                                 pass
-                        last_edit = now
                 
                 # Final update - ensure we send the complete response
                 if collected.strip():
                     if reply_msg:
+                        # Try to do final edit, if it fails just leave the last successful edit
                         try:
                             await reply_msg.edit(content=collected[:2000])
                         except discord.HTTPException:
                             pass
                     else:
+                        # No message sent yet, send it now
                         reply_msg = await message.reply(collected[:2000])
+                    
+                    # Add assistant response to history
+                    conv["messages"].append({"role": "assistant", "content": collected})
+                    
+                    # Estimate tokens and log
+                    estimated_tokens = _estimate_tokens(content + collected)
+                    self.bot.rate_limiter.record_tokens(user_id, message.guild.id, estimated_tokens)
+                    await self.bot.database.log_usage(
+                        user_id=user_id,
+                        command="mention",
+                        guild_id=message.guild.id,
+                        tokens_used=estimated_tokens,
+                    )
                 else:
                     # If no content was generated, send a fallback message
                     await message.reply("I couldn't generate a response. Please try again.")
                 
-                # Add assistant response to history
-                if collected.strip():
-                    conv["messages"].append({"role": "assistant", "content": collected})
-                
-                # Estimate tokens and log
-                estimated_tokens = _estimate_tokens(content + collected)
-                self.bot.rate_limiter.record_tokens(user_id, message.guild.id, estimated_tokens)
-                await self.bot.database.log_usage(
-                    user_id=user_id,
-                    command="mention",
-                    guild_id=message.guild.id,
-                    tokens_used=estimated_tokens,
-                )
-                
-            except LLMClientError as exc:
-                await message.reply(
-                    embed=Embedder.error("Chat Error", str(exc)),
-                    delete_after=15,
-                )
-            except Exception as exc:
-                logger.error("Unexpected error in mention handler: %s", exc, exc_info=True)
-                await message.reply(
-                    embed=Embedder.error("Unexpected Error", "Something went wrong. Please try again."),
-                    delete_after=15,
-                )
+        except LLMClientError as exc:
+            await message.reply(
+                embed=Embedder.error("Chat Error", str(exc)),
+                delete_after=15,
+            )
+        except Exception as exc:
+            logger.error("Unexpected error in mention handler: %s", exc, exc_info=True)
+            await message.reply(
+                embed=Embedder.error("Unexpected Error", "Something went wrong. Please try again."),
+                delete_after=15,
+            )
 
     def _cleanup_expired_conversations(self) -> None:
         """Remove conversations that have been inactive for too long."""
