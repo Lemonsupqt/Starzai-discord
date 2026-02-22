@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 class StyleSelectorView(discord.ui.View):
     """Interactive button view for selecting text improvement styles."""
     
-    def __init__(self, bot: StarzaiBot, user_id: int, original_text: str):
+    def __init__(self, bot: StarzaiBot, user_id: int, original_text: str, original_message: discord.Message):
         super().__init__(timeout=300)  # 5 minute timeout
         self.bot = bot
         self.user_id = user_id
         self.original_text = original_text
+        self.original_message = original_message
         
         # Add buttons for each style
         styles = [
@@ -102,7 +103,9 @@ class StyleSelectorView(discord.ui.View):
                 )
                 embed.set_footer(text=f"Style: {style.title()} | Click another button to try a different style")
                 
-                await interaction.followup.send(embed=embed, view=self)
+                # Edit the original message instead of sending a new one
+                await self.original_message.edit(embed=embed, view=self)
+                await interaction.followup.send("✅ Text improved!", ephemeral=True)
                 
                 await self.bot.database.log_usage(
                     user_id=interaction.user.id,
@@ -202,9 +205,6 @@ class GrammarCog(commands.Cog, name="Grammar"):
             )
             return
 
-        # Create the style selector view
-        view = StyleSelectorView(self.bot, interaction.user.id, text)
-        
         embed = discord.Embed(
             title="📝 Text Improvement",
             description=(
@@ -217,7 +217,13 @@ class GrammarCog(commands.Cog, name="Grammar"):
         )
         embed.set_footer(text="Buttons expire in 5 minutes")
         
-        await interaction.response.send_message(embed=embed, view=view)
+        # Send the message first, then create the view with the message reference
+        await interaction.response.send_message(embed=embed)
+        message = await interaction.original_response()
+        
+        # Now create the view with the message reference and edit to add buttons
+        view = StyleSelectorView(self.bot, interaction.user.id, text, message)
+        await message.edit(view=view)
 
 
 async def setup(bot: StarzaiBot) -> None:

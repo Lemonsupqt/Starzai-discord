@@ -223,10 +223,12 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             )
         except Exception as exc:
             logger.error("Unexpected birth chart error: %s", exc, exc_info=True)
+            error_details = f"{type(exc).__name__}: {str(exc)}"
             await interaction.followup.send(
                 embed=Embedder.error(
-                    "Unexpected Error",
-                    "Something went wrong while generating your birth chart. Please try again."
+                    "Birth Chart Error",
+                    f"🌙 An unexpected error occurred:\n```\n{error_details[:1000]}\n```\n\n"
+                    "Please try again with valid birth information (YYYY-MM-DD, HH:MM format)."
                 )
             )
 
