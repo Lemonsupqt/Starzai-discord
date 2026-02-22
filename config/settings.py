@@ -35,8 +35,8 @@ class Settings:
 
     # Discord
     discord_token: str = field(default_factory=lambda: os.getenv("DISCORD_TOKEN", ""))
-    application_id: str = field(
-        default_factory=lambda: os.getenv("DISCORD_APPLICATION_ID", "")
+    application_id: Optional[int] = field(
+        default_factory=lambda: int(os.getenv("DISCORD_APPLICATION_ID", "0")) or None
     )
 
     # MegaLLM
@@ -122,4 +122,3 @@ class Settings:
         if not self.available_models:
             errors.append("AVAILABLE_MODELS must contain at least one model")
         return errors
-

@@ -161,7 +161,7 @@ class GamesCog(commands.Cog, name="Games"):
             f"Create an original {difficulty} riddle.\n\n"
             "Format:\n"
             "**Riddle:**\n<the riddle in a poetic/mysterious style>\n\n"
-            "**Difficulty:** {difficulty}\n\n"
+            f"**Difficulty:** {difficulty}\n\n"
             "**Hint:** ||<a subtle hint>||\n\n"
             "**Answer:** ||<the answer with explanation>||\n\n"
             "Make it creative and thought-provoking!"
@@ -194,4 +194,3 @@ class GamesCog(commands.Cog, name="Games"):
 
 async def setup(bot: StarzaiBot) -> None:
     await bot.add_cog(GamesCog(bot))
-

@@ -182,21 +182,27 @@ class LLMClient:
                     status_code=resp.status,
                 )
 
-            async for line in resp.content:
-                decoded = line.decode("utf-8").strip()
-                if not decoded or not decoded.startswith("data: "):
-                    continue
-                data_str = decoded[6:]
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                    delta = data["choices"][0].get("delta", {})
-                    content = delta.get("content")
-                    if content:
-                        yield content
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    continue
+            # Buffer for incomplete lines across chunks
+            buffer = b""
+            async for chunk in resp.content.iter_any():
+                buffer += chunk
+                # Process complete lines
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    decoded = line.decode("utf-8").strip()
+                    if not decoded or not decoded.startswith("data: "):
+                        continue
+                    data_str = decoded[6:]
+                    if data_str == "[DONE]":
+                        return
+                    try:
+                        data = json.loads(data_str)
+                        delta = data["choices"][0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
 
     # ── Convenience Methods ──────────────────────────────────────────
 
@@ -224,4 +230,3 @@ class LLMClient:
         except Exception as exc:
             logger.debug("Could not fetch models from API: %s", exc)
         return []
-

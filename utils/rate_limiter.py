@@ -1,18 +1,15 @@
 """
 Multi-level rate limiter: per-user, per-server, global, and token-based.
-Uses in-memory caches backed by cachetools with DB fallback for token quotas.
+Uses in-memory caches with TTL for token quotas.
 """
 
 from __future__ import annotations
 
-import logging
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 from cachetools import TTLCache
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -204,4 +201,3 @@ class RateLimiter:
             "tokens_today": self._user_tokens.get(user_id, 0),
             "token_limit": self.daily_token_limit_user,
         }
-

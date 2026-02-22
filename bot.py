@@ -56,7 +56,7 @@ class StarzaiBot(commands.Bot):
         super().__init__(
             command_prefix="!",  # Slash commands are primary
             intents=intents,
-            application_id=settings.application_id or None,
+            application_id=settings.application_id,
         )
 
         self.settings = settings
@@ -186,4 +186,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

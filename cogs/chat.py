@@ -38,6 +38,11 @@ def _truncate(text: str, limit: int = MAX_CONTEXT_CHARS) -> str:
     return text[:limit] + "…" if len(text) > limit else text
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimation: ~4 chars per token for English text."""
+    return max(1, len(text) // 4)
+
+
 class ChatCog(commands.Cog, name="Chat"):
     """Core AI chat features powered by MegaLLM."""
 
@@ -153,9 +158,12 @@ class ChatCog(commands.Cog, name="Chat"):
 
             # Final edit with full response
             if msg:
+                # Estimate tokens for streaming response
+                estimated_tokens = _estimate_tokens(message + collected)
                 await msg.edit(
-                    embed=Embedder.chat_response(collected, model)
+                    embed=Embedder.chat_response(collected, model, estimated_tokens)
                 )
+                await self._log(interaction, "chat", model, tokens=estimated_tokens, success=True)
             else:
                 # Fallback if stream yielded nothing
                 resp = await self.bot.llm.simple_prompt(message, model=model)
@@ -165,8 +173,7 @@ class ChatCog(commands.Cog, name="Chat"):
                         resp.content, model, resp.total_tokens, resp.latency_ms
                     )
                 )
-
-            await self._log(interaction, "chat", model, success=True)
+                await self._log(interaction, "chat", model, tokens=resp.total_tokens, success=True)
 
         except LLMClientError as exc:
             logger.error("LLM error in /chat: %s", exc)
@@ -354,13 +361,17 @@ class ChatCog(commands.Cog, name="Chat"):
                     last_edit = now
 
             if reply:
-                await reply.edit(embed=Embedder.chat_response(collected, model))
+                # Estimate tokens for streaming response
+                estimated_tokens = _estimate_tokens(message + collected)
+                await reply.edit(embed=Embedder.chat_response(collected, model, estimated_tokens))
+                await self._log(interaction, "say", model, tokens=estimated_tokens, success=True)
             else:
                 resp = await self.bot.llm.simple_prompt(message, model=model)
                 collected = resp.content
                 await interaction.followup.send(
                     embed=Embedder.chat_response(resp.content, model, resp.total_tokens, resp.latency_ms)
                 )
+                await self._log(interaction, "say", model, tokens=resp.total_tokens, success=True)
 
             # Save messages to conversation
             await self.bot.database.append_message(
@@ -369,7 +380,6 @@ class ChatCog(commands.Cog, name="Chat"):
             await self.bot.database.append_message(
                 conv["id"], "assistant", collected, MAX_CONVERSATION_MESSAGES
             )
-            await self._log(interaction, "say", model, success=True)
 
         except LLMClientError as exc:
             await interaction.followup.send(embed=Embedder.error("AI Error", str(exc)))
