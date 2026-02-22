@@ -21,6 +21,105 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class StyleSelectorView(discord.ui.View):
+    """Interactive button view for selecting text improvement styles."""
+    
+    def __init__(self, bot: StarzaiBot, user_id: int, original_text: str):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.bot = bot
+        self.user_id = user_id
+        self.original_text = original_text
+        
+        # Add buttons for each style
+        styles = [
+            ("Formal", "formal", discord.ButtonStyle.primary),
+            ("Casual", "casual", discord.ButtonStyle.secondary),
+            ("Academic", "academic", discord.ButtonStyle.primary),
+            ("Creative", "creative", discord.ButtonStyle.secondary),
+            ("Concise", "concise", discord.ButtonStyle.primary),
+            ("Professional", "professional", discord.ButtonStyle.secondary),
+        ]
+        
+        for i, (label, style, button_style) in enumerate(styles):
+            button = discord.ui.Button(
+                label=label,
+                style=button_style,
+                custom_id=f"style_{style}",
+                row=i // 3,  # 3 buttons per row
+            )
+            button.callback = self._make_callback(style)
+            self.add_item(button)
+    
+    def _make_callback(self, style: str):
+        """Create a callback for a specific style button."""
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    "These buttons aren't for you! Use `/improve-text` to get your own.",
+                    ephemeral=True,
+                )
+                return
+            
+            await interaction.response.defer()
+            
+            style_descriptions = {
+                "formal": "professional, polished, suitable for business or academic contexts",
+                "casual": "relaxed, conversational, friendly tone",
+                "academic": "scholarly, precise, with appropriate terminology",
+                "creative": "vivid, expressive, engaging and unique",
+                "concise": "brief, to-the-point, removing all unnecessary words",
+                "professional": "clear, authoritative, suitable for workplace communication",
+            }
+            style_desc = style_descriptions.get(style, style)
+            
+            prompt = (
+                f"Rewrite the following text in a {style} style ({style_desc}).\n\n"
+                f"Original text: \"{self.original_text}\"\n\n"
+                "Provide ONLY the improved text in your response. "
+                "Do not include explanations, labels, or any other text. "
+                "Just output the rewritten version directly."
+            )
+            
+            try:
+                resp = await self.bot.llm.simple_prompt(
+                    prompt,
+                    system=f"You are an expert writing coach. Output ONLY the rewritten text, nothing else.",
+                    max_tokens=4096,
+                )
+                
+                improved_text = resp.content.strip()
+                
+                # Create embed with copyable code block
+                embed = discord.Embed(
+                    title=f"📝 Text Improved — {style.title()} Style",
+                    description=f"**Improved Text:**\n```\n{improved_text[:3900]}\n```",
+                    color=discord.Color.green(),
+                )
+                embed.add_field(
+                    name="Original Text",
+                    value=f"```\n{self.original_text[:1000]}\n```",
+                    inline=False,
+                )
+                embed.set_footer(text=f"Style: {style.title()} | Click another button to try a different style")
+                
+                await interaction.followup.send(embed=embed, view=self)
+                
+                await self.bot.database.log_usage(
+                    user_id=interaction.user.id,
+                    command="improve-text",
+                    guild_id=interaction.guild_id,
+                    tokens_used=resp.total_tokens,
+                    latency_ms=resp.latency_ms,
+                )
+                
+            except LLMClientError as exc:
+                await interaction.followup.send(
+                    embed=Embedder.error("Improvement Failed", str(exc))
+                )
+        
+        return callback
+
+
 class GrammarCog(commands.Cog, name="Grammar"):
     """Advanced grammar checking and text improvement."""
 
@@ -86,23 +185,15 @@ class GrammarCog(commands.Cog, name="Grammar"):
 
     @app_commands.command(
         name="improve-text",
-        description="Improve text with a specific writing style",
+        description="Improve text with interactive style selection",
     )
     @app_commands.describe(
         text="The text to improve",
-        style="Writing style to apply",
-    )
-    @app_commands.choices(
-        style=[
-            app_commands.Choice(name=s.title(), value=s)
-            for s in TEXT_STYLES
-        ]
     )
     async def improve_text_cmd(
         self,
         interaction: discord.Interaction,
         text: str,
-        style: str = "formal",
     ) -> None:
         result = self.bot.rate_limiter.check(interaction.user.id, interaction.guild_id)
         if not result.allowed:
@@ -111,52 +202,22 @@ class GrammarCog(commands.Cog, name="Grammar"):
             )
             return
 
-        await interaction.response.defer()
-
-        style_descriptions = {
-            "formal": "professional, polished, suitable for business or academic contexts",
-            "casual": "relaxed, conversational, friendly tone",
-            "academic": "scholarly, precise, with appropriate terminology",
-            "creative": "vivid, expressive, engaging and unique",
-            "concise": "brief, to-the-point, removing all unnecessary words",
-            "professional": "clear, authoritative, suitable for workplace communication",
-        }
-        style_desc = style_descriptions.get(style, style)
-
-        prompt = (
-            f"Rewrite the following text in a {style} style ({style_desc}).\n\n"
-            f"Original text: \"{text}\"\n\n"
-            "Provide:\n"
-            "1. **Improved Text** — the rewritten version\n"
-            "2. **Changes Made** — briefly explain the key changes\n"
-            "3. **Style Notes** — 1-2 tips for writing in this style"
+        # Create the style selector view
+        view = StyleSelectorView(self.bot, interaction.user.id, text)
+        
+        embed = discord.Embed(
+            title="📝 Text Improvement",
+            description=(
+                "**Select a style to improve your text:**\n\n"
+                "Click any button below to see your text rewritten in that style. "
+                "The improved text will be in a copyable code block for easy copying!\n\n"
+                f"**Your Original Text:**\n```\n{text[:1000]}\n```"
+            ),
+            color=discord.Color.blue(),
         )
-
-        try:
-            resp = await self.bot.llm.simple_prompt(
-                prompt,
-                system=f"You are an expert writing coach specializing in {style} writing.",
-                max_tokens=4096,  # Maximum tokens for detailed text improvement
-            )
-
-            embed = Embedder.standard(
-                f"📝 Text Improvement — {style.title()}",
-                resp.content,
-                fields=[("Original Text", text[:1024], False)],
-            )
-            await interaction.followup.send(embed=embed)
-            await self.bot.database.log_usage(
-                user_id=interaction.user.id,
-                command="improve-text",
-                guild_id=interaction.guild_id,
-                tokens_used=resp.total_tokens,
-                latency_ms=resp.latency_ms,
-            )
-
-        except LLMClientError as exc:
-            await interaction.followup.send(
-                embed=Embedder.error("Improvement Failed", str(exc))
-            )
+        embed.set_footer(text="Buttons expire in 5 minutes")
+        
+        await interaction.response.send_message(embed=embed, view=view)
 
 
 async def setup(bot: StarzaiBot) -> None:

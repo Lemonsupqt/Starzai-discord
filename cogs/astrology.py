@@ -5,6 +5,7 @@ Astrology & Zodiac cog — Horoscopes and birth chart analysis.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import discord
@@ -65,9 +66,11 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         await interaction.response.defer()
 
         emoji = ZODIAC_EMOJIS.get(sign.lower(), "⭐")
+        current_date = datetime.now().strftime("%B %d, %Y")  # e.g., "February 23, 2026"
 
         prompt = (
-            f"Create a {period} horoscope for {sign.title()} ({emoji}).\n\n"
+            f"Create a {period} horoscope for {sign.title()} ({emoji}) "
+            f"for today, {current_date}.\n\n"
             "Include:\n"
             "1. **General Overview** — the overall energy and theme\n"
             "2. **Love & Relationships** — romantic and social insights\n"
@@ -130,25 +133,39 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         await interaction.response.defer()
 
         prompt = (
-            f"Create a birth chart reading for someone born on {date} at {time} in {location}.\n\n"
-            "Include:\n"
-            "1. **Sun Sign** — their core identity and ego\n"
-            "2. **Moon Sign** — their emotional nature (estimate based on date)\n"
-            "3. **Rising Sign** — how they appear to others (estimate based on time)\n"
-            "4. **Key Planetary Placements** — significant planet positions\n"
-            "5. **Personality Profile** — a synthesized personality overview\n"
-            "6. **Life Path Insights** — potential strengths and challenges\n"
-            "7. **Compatibility** — which signs they tend to harmonize with\n\n"
-            "Note: This is an AI-generated estimate. For a precise chart, "
-            "an exact birth time and ephemeris are needed.\n"
-            "Make the reading feel personal and insightful."
+            f"Create a detailed and insightful birth chart reading for someone born:\n"
+            f"📅 Date: {date}\n"
+            f"🕐 Time: {time} (24-hour format)\n"
+            f"📍 Location: {location}\n\n"
+            
+            f"Provide a comprehensive birth chart analysis including:\n\n"
+            
+            f"1. **Sun Sign** — their core identity, ego, and life purpose\n"
+            f"2. **Moon Sign** — emotional nature and inner world (estimate from date)\n"
+            f"3. **Rising Sign** — how they appear to others (estimate from time and location)\n"
+            f"4. **Mercury Placement** — communication style and thinking patterns\n"
+            f"5. **Venus Placement** — love language and relationships\n"
+            f"6. **Mars Placement** — drive, passion, and action style\n"
+            f"7. **Key Planetary Aspects** — important planetary relationships\n"
+            f"8. **House Placements** — life areas affected (simplified)\n"
+            f"9. **Personality Synthesis** — integrated personality overview from all placements\n"
+            f"10. **Life Path & Potential** — strengths, challenges, and life purpose\n"
+            f"11. **Compatibility** — which signs harmonize well with this birth chart\n"
+            f"12. **Practical Insights** — actionable advice based on the chart\n\n"
+            
+            f"Note: This is an AI-generated estimate. For a precise chart, an exact birth time "
+            f"and professional ephemeris data are needed. Use accessible language while maintaining depth."
         )
 
         try:
             resp = await self.bot.llm.simple_prompt(
                 prompt,
-                system="You are an experienced astrologer creating detailed, personalized birth chart readings.",
-                max_tokens=3000,  # Birth charts need more tokens
+                system=(
+                    "You are an experienced and knowledgeable astrologer with deep expertise in "
+                    "natal birth chart analysis. Provide detailed, insightful, and personalized readings. "
+                    "Be specific and comprehensive. Structure your response clearly with each section labeled."
+                ),
+                max_tokens=4096,  # Increased for more detailed analysis
             )
 
             embed = Embedder.standard(
@@ -171,17 +188,38 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         except LLMClientError as exc:
             error_msg = str(exc)
+            
+            # Specific error mapping
             if "timeout" in error_msg.lower():
-                error_msg = "The request took too long. Birth charts are complex - please try again in a moment."
+                user_msg = (
+                    "⏱️ The request took too long. Birth charts are complex - please try again in a moment. "
+                    "If the problem persists, make sure your birth information is complete."
+                )
             elif "token" in error_msg.lower():
-                error_msg = "The response was too long. Try requesting a shorter reading or check your token limits."
+                user_msg = (
+                    "📝 The response was too long for the current API configuration. "
+                    "Try with a simpler location name or try again."
+                )
             elif "rate" in error_msg.lower():
-                error_msg = "Too many requests. Please wait a moment before trying again."
+                user_msg = (
+                    "⏸️ Too many requests to the API. Please wait a moment before trying again. "
+                    "Birth charts use a lot of processing power!"
+                )
+            elif "invalid" in error_msg.lower() or "400" in error_msg.lower():
+                user_msg = (
+                    "❌ Invalid birth information provided. Make sure:\n"
+                    "- Date is in YYYY-MM-DD format (e.g., 1990-01-15)\n"
+                    "- Time is in HH:MM format (e.g., 14:30)\n"
+                    "- Location is a valid city name"
+                )
             else:
-                error_msg = f"Failed to generate birth chart: {error_msg}"
+                user_msg = (
+                    f"🌙 Birth chart generation encountered an issue: {error_msg}\n\n"
+                    "Please try again with complete information."
+                )
             
             await interaction.followup.send(
-                embed=Embedder.error("Birth Chart Error", error_msg)
+                embed=Embedder.error("Birth Chart Error", user_msg)
             )
         except Exception as exc:
             logger.error("Unexpected birth chart error: %s", exc, exc_info=True)
