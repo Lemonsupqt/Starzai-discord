@@ -211,13 +211,14 @@ class LLMClient:
         prompt: str,
         system: str = "You are a helpful AI assistant.",
         model: Optional[str] = None,
+        max_tokens: int = 2048,
     ) -> LLMResponse:
         """Send a simple prompt with a system message."""
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ]
-        return await self.chat(messages, model=model)
+        return await self.chat(messages, model=model, max_tokens=max_tokens)
 
     async def list_models(self) -> List[str]:
         """List available models from the API (or fallback to config)."""

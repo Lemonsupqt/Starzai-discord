@@ -1,5 +1,5 @@
 """
-Core LLM Chat cog — /chat, /ask, /conversation, /set-model, /models
+Core LLM Chat cog — /chat, /ask, /conversation, /set-model, /models, @mention conversations
 """
 
 from __future__ import annotations
@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from typing import TYPE_CHECKING, Optional
+import time
+from typing import TYPE_CHECKING, Dict, Optional
 
 import discord
 from discord import app_commands
@@ -29,9 +30,13 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
     "You are Starzai, a friendly and knowledgeable AI assistant on Discord. "
-    "Be helpful, concise, and engaging. Use markdown formatting when appropriate. "
-    "If you don't know something, say so honestly."
+    "Be helpful, concise, and engaging. Use Discord markdown formatting: "
+    "**bold**, *italic*, __underline__, ~~strikethrough~~, `code`, ```code blocks```. "
+    "Keep responses natural and conversational. If you don't know something, say so honestly."
 )
+
+# Auto-expiry for @mention conversations (10 minutes of inactivity)
+MENTION_CONVERSATION_TIMEOUT = 600  # seconds
 
 
 def _truncate(text: str, limit: int = MAX_CONTEXT_CHARS) -> str:
@@ -48,6 +53,8 @@ class ChatCog(commands.Cog, name="Chat"):
 
     def __init__(self, bot: StarzaiBot):
         self.bot = bot
+        # Track @mention conversations: {user_id: {"messages": [...], "last_activity": timestamp}}
+        self.mention_conversations: Dict[int, Dict] = {}
 
     # ── Helper: rate-limit gate ──────────────────────────────────────
 
@@ -425,9 +432,241 @@ class ChatCog(commands.Cog, name="Chat"):
     @app_commands.command(name="models", description="List available AI models")
     async def models_cmd(self, interaction: discord.Interaction) -> None:
         current = await self._resolve_model(interaction.user.id)
+        view = ModelSelectorView(self.bot, interaction.user.id, current)
         await interaction.response.send_message(
-            embed=Embedder.model_list(self.bot.settings.available_models, current)
+            embed=Embedder.model_list(self.bot.settings.available_models, current),
+            view=view,
+            ephemeral=True,
         )
+
+    # ── /stop ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="stop", description="Stop your current conversation")
+    async def stop_cmd(self, interaction: discord.Interaction) -> None:
+        user_id = interaction.user.id
+        
+        # Check both conversation types
+        db_conv = await self.bot.database.get_conversation(user_id)
+        mention_conv = self.mention_conversations.get(user_id)
+        
+        if not db_conv and not mention_conv:
+            await interaction.response.send_message(
+                embed=Embedder.warning(
+                    "No Active Conversation",
+                    "You don't have any active conversations to stop."
+                ),
+                ephemeral=True,
+            )
+            return
+        
+        # Clear both types
+        if db_conv:
+            await self.bot.database.clear_conversation(user_id)
+        if mention_conv:
+            del self.mention_conversations[user_id]
+        
+        await interaction.response.send_message(
+            embed=Embedder.conversation_status(
+                "stop",
+                "Your conversation has been stopped and cleared."
+            ),
+            ephemeral=True,
+        )
+
+    # ── @mention handler ─────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        """Handle @mentions for natural conversations."""
+        # Ignore bots and DMs
+        if message.author.bot or not message.guild:
+            return
+        
+        # Check if bot was mentioned
+        if self.bot.user not in message.mentions:
+            return
+        
+        # Remove the mention from the message
+        content = message.content
+        for mention in message.mentions:
+            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+        content = content.strip()
+        
+        if not content:
+            await message.reply("Hey! You mentioned me but didn't say anything. How can I help? 😊")
+            return
+        
+        user_id = message.author.id
+        
+        # Rate limiting
+        result = self.bot.rate_limiter.check(user_id, message.guild.id, expensive=True)
+        if not result.allowed:
+            await message.reply(
+                embed=Embedder.rate_limited(result.retry_after),
+                delete_after=10,
+            )
+            return
+        
+        token_result = self.bot.rate_limiter.check_token_budget(user_id, message.guild.id)
+        if not token_result.allowed:
+            await message.reply(
+                embed=Embedder.warning("Token Limit", token_result.reason),
+                delete_after=15,
+            )
+            return
+        
+        # Clean up expired conversations
+        self._cleanup_expired_conversations()
+        
+        # Get or create conversation
+        if user_id not in self.mention_conversations:
+            self.mention_conversations[user_id] = {
+                "messages": [],
+                "last_activity": time.time(),
+            }
+        
+        conv = self.mention_conversations[user_id]
+        conv["last_activity"] = time.time()
+        
+        # Add user message to history
+        conv["messages"].append({"role": "user", "content": content})
+        
+        # Keep only last 10 messages (5 exchanges)
+        if len(conv["messages"]) > MAX_CONVERSATION_MESSAGES:
+            conv["messages"] = conv["messages"][-MAX_CONVERSATION_MESSAGES:]
+        
+        # Get user's preferred model
+        model = await self._resolve_model(user_id)
+        
+        # Build messages for API
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(conv["messages"])
+        
+        # Show typing indicator
+        async with message.channel.typing():
+            try:
+                # Stream the response
+                collected = ""
+                reply_msg = None
+                last_edit = 0
+                
+                async for chunk in self.bot.llm.chat_stream(messages, model=model):
+                    collected += chunk
+                    now = time.time()
+                    
+                    # Edit message every STREAMING_EDIT_INTERVAL seconds
+                    if now - last_edit >= STREAMING_EDIT_INTERVAL:
+                        if not reply_msg:
+                            # Send initial message
+                            reply_msg = await message.reply(collected or "⏳ Thinking...")
+                        else:
+                            # Update existing message
+                            try:
+                                await reply_msg.edit(content=collected[:2000])  # Discord limit
+                            except discord.HTTPException:
+                                pass
+                        last_edit = now
+                
+                # Final update
+                if reply_msg and collected:
+                    try:
+                        await reply_msg.edit(content=collected[:2000])
+                    except discord.HTTPException:
+                        pass
+                elif not reply_msg and collected:
+                    reply_msg = await message.reply(collected[:2000])
+                
+                # Add assistant response to history
+                conv["messages"].append({"role": "assistant", "content": collected})
+                
+                # Estimate tokens and log
+                estimated_tokens = _estimate_tokens(content + collected)
+                self.bot.rate_limiter.consume_tokens(user_id, message.guild.id, estimated_tokens)
+                await self.bot.database.log_usage(
+                    user_id=user_id,
+                    command="mention",
+                    guild_id=message.guild.id,
+                    tokens_used=estimated_tokens,
+                )
+                
+            except LLMClientError as exc:
+                await message.reply(
+                    embed=Embedder.error("Chat Error", str(exc)),
+                    delete_after=15,
+                )
+            except Exception as exc:
+                logger.error("Unexpected error in mention handler: %s", exc, exc_info=True)
+                await message.reply(
+                    embed=Embedder.error("Unexpected Error", "Something went wrong. Please try again."),
+                    delete_after=15,
+                )
+
+    def _cleanup_expired_conversations(self) -> None:
+        """Remove conversations that have been inactive for too long."""
+        now = time.time()
+        expired = [
+            user_id
+            for user_id, conv in self.mention_conversations.items()
+            if now - conv["last_activity"] > MENTION_CONVERSATION_TIMEOUT
+        ]
+        for user_id in expired:
+            del self.mention_conversations[user_id]
+            logger.info("Expired mention conversation for user %s", user_id)
+
+
+# ── Model Selector View ──────────────────────────────────────────────
+
+class ModelSelectorView(discord.ui.View):
+    """Interactive button view for selecting AI models."""
+    
+    def __init__(self, bot: StarzaiBot, user_id: int, current_model: str):
+        super().__init__(timeout=180)  # 3 minute timeout
+        self.bot = bot
+        self.user_id = user_id
+        self.current_model = current_model
+        
+        # Add buttons for each model (max 5 per row, max 25 total)
+        models = bot.settings.available_models[:25]  # Discord limit
+        for i, model in enumerate(models):
+            button = discord.ui.Button(
+                label=model,
+                style=discord.ButtonStyle.primary if model == current_model else discord.ButtonStyle.secondary,
+                custom_id=f"model_{model}",
+                row=i // 5,  # 5 buttons per row
+            )
+            button.callback = self._make_callback(model)
+            self.add_item(button)
+    
+    def _make_callback(self, model: str):
+        """Create a callback for a specific model button."""
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    "These buttons aren't for you! Use `/models` to get your own.",
+                    ephemeral=True,
+                )
+                return
+            
+            resolved = self.bot.settings.resolve_model(model)
+            await self.bot.database.set_user_model(self.user_id, resolved)
+            
+            # Update the view to show new selection
+            for item in self.children:
+                if isinstance(item, discord.ui.Button):
+                    if item.label == model:
+                        item.style = discord.ButtonStyle.primary
+                    else:
+                        item.style = discord.ButtonStyle.secondary
+            
+            await interaction.response.edit_message(
+                embed=Embedder.success(
+                    "Model Updated",
+                    f"Your preferred model is now **{resolved}**.\nAll future requests will use this model."
+                ),
+                view=self,
+            )
+        
+        return callback
 
 
 async def setup(bot: StarzaiBot) -> None:

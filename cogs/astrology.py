@@ -148,6 +148,7 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             resp = await self.bot.llm.simple_prompt(
                 prompt,
                 system="You are an experienced astrologer creating detailed, personalized birth chart readings.",
+                max_tokens=3000,  # Birth charts need more tokens
             )
 
             embed = Embedder.standard(
@@ -169,11 +170,28 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             )
 
         except LLMClientError as exc:
+            error_msg = str(exc)
+            if "timeout" in error_msg.lower():
+                error_msg = "The request took too long. Birth charts are complex - please try again in a moment."
+            elif "token" in error_msg.lower():
+                error_msg = "The response was too long. Try requesting a shorter reading or check your token limits."
+            elif "rate" in error_msg.lower():
+                error_msg = "Too many requests. Please wait a moment before trying again."
+            else:
+                error_msg = f"Failed to generate birth chart: {error_msg}"
+            
             await interaction.followup.send(
-                embed=Embedder.error("Birth Chart Error", str(exc))
+                embed=Embedder.error("Birth Chart Error", error_msg)
+            )
+        except Exception as exc:
+            logger.error("Unexpected birth chart error: %s", exc, exc_info=True)
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Unexpected Error",
+                    "Something went wrong while generating your birth chart. Please try again."
+                )
             )
 
 
 async def setup(bot: StarzaiBot) -> None:
     await bot.add_cog(AstrologyCog(bot))
-
