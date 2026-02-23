@@ -637,6 +637,14 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
             # Parse the analysis (try to extract JSON-like structure)
             analysis_data = self._parse_analysis_response(analysis_text)
             
+            # BONUS: Analyze top 3 channels for channel-specific insights
+            top_channels = self._get_top_channels(messages, top_n=3)
+            if top_channels:
+                channel_insights = await self._analyze_top_channels(
+                    top_channels, user.display_name, model
+                )
+                analysis_data["channel_insights"] = channel_insights
+            
             # Store the analysis
             date_range = f"Last {len(messages):,} messages"
             await self.bot.database.store_user_analysis(
@@ -654,8 +662,19 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
             # Create full text report
             full_report = format_full_report(analysis_data, user.display_name, len(messages))
             
-            # Create interactive view
-            view = AnalysisView(pages, full_report)
+            # Create interactive view with re-analysis capability
+            async def reanalyze_with_model(inter, new_model, msgs, uname):
+                await self._reanalyze_with_model(inter, new_model, msgs, uname, target_user_id, guild_id, analyzer_id)
+            
+            view = AnalysisView(
+                pages, 
+                full_report, 
+                user.display_name, 
+                len(messages),
+                analysis_data,
+                messages,
+                reanalyze_callback=reanalyze_with_model
+            )
             
             # Send first page with view
             await progress_msg.edit(
@@ -723,6 +742,157 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
             sections["overview"] = response[:1000]
         
         return sections
+
+    def _get_top_channels(self, messages: List[Dict[str, Any]], top_n: int = 3) -> Dict[str, List[Dict[str, Any]]]:
+        """Identify top N most active channels and group messages by channel."""
+        from collections import Counter
+        
+        channel_counts = Counter(msg['channel_name'] for msg in messages)
+        top_channels = channel_counts.most_common(top_n)
+        
+        channel_messages = {}
+        for channel_name, count in top_channels:
+            channel_messages[channel_name] = [
+                msg for msg in messages if msg['channel_name'] == channel_name
+            ]
+        
+        return channel_messages
+
+    async def _analyze_top_channels(
+        self,
+        channel_messages: Dict[str, List[Dict[str, Any]]],
+        user_name: str,
+        model: str
+    ) -> str:
+        """Run secondary analysis on top channels to get channel-specific insights."""
+        channel_insights = []
+        
+        for channel_name, messages in channel_messages.items():
+            sample = "\n".join([f"- {m['content'][:150]}" for m in messages[:20]])
+            
+            prompt = f"""Analyze {user_name}'s behavior specifically in #{channel_name} based on {len(messages)} messages:
+
+Sample messages from #{channel_name}:
+{sample}
+
+Provide a brief 2-3 sentence insight about:
+- What topics they discuss in this channel
+- How their behavior differs here vs. elsewhere
+- Any unique patterns specific to this channel
+
+Be concise and insightful."""
+
+            analysis = ""
+            async for chunk in self.bot.llm.chat_stream(
+                [{"role": "user", "content": prompt}],
+                model=model
+            ):
+                analysis += chunk
+            
+            channel_insights.append(f"**#{channel_name}** ({len(messages)} messages)\n{analysis}")
+        
+        return "\n\n".join(channel_insights)
+
+    async def _reanalyze_with_model(
+        self,
+        interaction: discord.Interaction,
+        model: str,
+        messages: List[Dict[str, Any]],
+        user_name: str,
+        target_user_id: str,
+        guild_id: str,
+        analyzer_id: str
+    ) -> None:
+        """Re-analyze user with a different AI model."""
+        try:
+            sample_size = min(100, len(messages))
+            step = max(1, len(messages) // sample_size)
+            message_samples = "\n".join([
+                f"- {messages[i]['content'][:200]}" 
+                for i in range(0, len(messages), step)
+            ][:100])
+            
+            analysis_prompt = f"""Analyze this Discord user comprehensively based on {len(messages):,} messages.
+
+User: {user_name}
+Messages: {len(messages):,}
+
+Sample messages (chronologically distributed):
+{message_samples}
+
+Provide a DETAILED analysis in the following JSON-like structure:
+
+{{
+  "overview": "2-3 sentence high-level summary of who they are",
+  "communication_style": "How they express themselves (tone, length, emoji use, formatting). Use bullet points.",
+  "personality_traits": "Key personality characteristics observed. Use bullet points with emojis.",
+  "interests": "Main topics and interests they discuss. Use bullet points with emojis.",
+  "behavioral_patterns": "Notable habits, patterns, or quirks. Use bullet points.",
+  "activity_patterns": "When/how often they post, engagement level. Use bullet points.",
+  "social_dynamics": "How they interact with others, social role in server. Use bullet points.",
+  "vocabulary": "Unique phrases, favorite words, linguistic style. Use bullet points.",
+  "unique_insights": "Interesting observations that stand out. Use bullet points with emojis."
+}}
+
+Make it insightful, respectful, and engaging. Use Discord markdown formatting (**bold**, *italic*, `code`).
+Focus on observable patterns, not judgments. Be specific with examples when possible."""
+
+            analysis_text = ""
+            async for chunk in self.bot.llm.chat_stream(
+                [{"role": "user", "content": analysis_prompt}],
+                model=model
+            ):
+                analysis_text += chunk
+            
+            analysis_data = self._parse_analysis_response(analysis_text)
+            
+            top_channels = self._get_top_channels(messages, top_n=3)
+            if top_channels:
+                channel_insights = await self._analyze_top_channels(
+                    top_channels, user_name, model
+                )
+                analysis_data["channel_insights"] = channel_insights
+            
+            date_range = f"Last {len(messages):,} messages"
+            await self.bot.database.store_user_analysis(
+                target_user_id,
+                guild_id,
+                analyzer_id,
+                analysis_data,
+                len(messages),
+                date_range
+            )
+            
+            pages = create_analysis_embeds(analysis_data, user_name, len(messages))
+            full_report = format_full_report(analysis_data, user_name, len(messages))
+            
+            async def reanalyze_again(inter, new_model, msgs, uname):
+                await self._reanalyze_with_model(inter, new_model, msgs, uname, target_user_id, guild_id, analyzer_id)
+            
+            view = AnalysisView(
+                pages,
+                full_report,
+                user_name,
+                len(messages),
+                analysis_data,
+                messages,
+                reanalyze_callback=reanalyze_again
+            )
+            
+            await interaction.followup.send(
+                content=f"✅ **Re-analyzed with {model}!**",
+                embed=pages[0],
+                view=view,
+                ephemeral=True
+            )
+            view.message = await interaction.original_response()
+            
+        except Exception as e:
+            logger.error(f"Error re-analyzing: {e}", exc_info=True)
+            await interaction.followup.send(
+                f"❌ Error re-analyzing with {model}: {str(e)}",
+                ephemeral=True
+            )
 
     @app_commands.command(
         name="my-stats",
