@@ -50,8 +50,19 @@ class StarzaiBot(commands.Bot):
     """Custom Bot with shared services attached."""
 
     def __init__(self, settings: Settings):
+        # Enable all intents for full functionality
         intents = discord.Intents.default()
-        intents.message_content = True
+        
+        # PRIVILEGED INTENTS (must be enabled in Discord Developer Portal)
+        intents.message_content = True  # Read message content for personalization
+        intents.members = True          # Read member list and usernames
+        intents.presences = True        # See user status and activity
+        
+        # Additional useful intents
+        intents.guilds = True           # Guild (server) events
+        intents.messages = True         # Message events
+        intents.reactions = True        # Reaction events
+        intents.typing = True           # Typing indicators
 
         super().__init__(
             command_prefix="!",  # Slash commands are primary
