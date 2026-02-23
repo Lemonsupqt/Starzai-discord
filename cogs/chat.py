@@ -558,23 +558,52 @@ class ChatCog(commands.Cog, name="Chat"):
         analyzer_id = str(interaction.user.id)
         
         try:
-            # Check if we have a recent analysis cached
-            cached_analysis = await self.bot.db.get_user_analysis(
-                target_user_id, guild_id, analyzer_id
-            )
-            
-            # Fetch messages from database (deep search)
-            messages = await self.bot.db.search_user_messages(
+            # Try to fetch from database first
+            db_messages = await self.bot.db.search_user_messages(
                 target_user_id, guild_id, limit=200
             )
             
-            if not messages:
+            # If no database messages, fetch from Discord history across all channels
+            if not db_messages:
                 await interaction.followup.send(
-                    f"❌ No message history found for {user.display_name}. "
-                    "They might not have sent many messages yet!",
+                    f"🔍 No cached messages found. Searching Discord history for {user.display_name}...",
                     ephemeral=True
                 )
-                return
+                
+                # Search across all text channels
+                messages_found = []
+                for channel in interaction.guild.text_channels:
+                    if len(messages_found) >= 200:
+                        break
+                    
+                    try:
+                        permissions = channel.permissions_for(interaction.guild.me)
+                        if not permissions.read_message_history:
+                            continue
+                        
+                        async for msg in channel.history(limit=500):
+                            if msg.author.id == user.id and msg.content.strip():
+                                messages_found.append({
+                                    'content': msg.content,
+                                    'channel_id': str(channel.id),
+                                    'timestamp': msg.created_at.isoformat()
+                                })
+                                if len(messages_found) >= 200:
+                                    break
+                    except (discord.Forbidden, discord.HTTPException):
+                        continue
+                
+                if not messages_found:
+                    await interaction.followup.send(
+                        f"❌ No message history found for {user.display_name}. "
+                        "They might not have sent many messages yet!",
+                        ephemeral=True
+                    )
+                    return
+                
+                messages = messages_found
+            else:
+                messages = db_messages
             
             # Prepare analysis prompt
             message_samples = "\n".join([
@@ -633,7 +662,7 @@ Keep it insightful but respectful. Focus on observable patterns, not judgments."
         except Exception as e:
             logger.error(f"Error analyzing user: {e}", exc_info=True)
             await interaction.followup.send(
-                f"❌ An error occurred while analyzing {user.display_name}. Please try again later.",
+                f"❌ An error occurred while analyzing {user.display_name}: {str(e)}",
                 ephemeral=True
             )
 
@@ -825,9 +854,25 @@ Keep it insightful but respectful. Focus on observable patterns, not judgments."
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
-        """Handle @mentions for natural conversations."""
-        # Ignore bots and DMs
-        if message.author.bot or not message.guild:
+        """Handle @mentions for natural conversations and log messages for analysis."""
+        # Ignore DMs
+        if not message.guild:
+            return
+        
+        # Log non-bot messages to database for future analysis (async, don't await)
+        if not message.author.bot and message.content.strip():
+            try:
+                await self.bot.db.store_user_message(
+                    str(message.author.id),
+                    str(message.guild.id),
+                    str(message.channel.id),
+                    message.content
+                )
+            except Exception as e:
+                logger.debug(f"Failed to log message: {e}")
+        
+        # Ignore bots for conversation handling
+        if message.author.bot:
             return
         
         # Check if bot was mentioned
