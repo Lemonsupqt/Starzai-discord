@@ -225,44 +225,44 @@ class AstrologyCog(commands.Cog, name="Astrology"):
 
         await interaction.response.defer()
 
-        # Generate comprehensive birth chart - optimized for 5 pages
+        # Generate comprehensive birth chart - detailed analysis
         full_prompt = (
-            f"Create a detailed birth chart reading for someone born:\n"
+            f"Create a detailed and comprehensive birth chart reading for someone born:\n"
             f"Date: {date}\n"
             f"Time: {time}\n"
             f"Location: {location}\n\n"
             
-            f"Provide a comprehensive analysis covering:\n\n"
+            f"Provide an in-depth analysis covering:\n\n"
             
             f"**CORE IDENTITY**\n"
-            f"1. Sun Sign — Core identity, ego, life purpose\n"
-            f"2. Moon Sign — Emotional nature, inner world\n"
-            f"3. Rising Sign — Outer personality, first impressions\n"
-            f"4. Chart Ruler — Ruling planet significance\n\n"
+            f"1. Sun Sign — Core identity, ego, life purpose, strengths, shadow side\n"
+            f"2. Moon Sign — Emotional nature, inner world, subconscious patterns, needs\n"
+            f"3. Rising Sign — Outer personality, first impressions, life approach\n"
+            f"4. Chart Ruler — Ruling planet and its profound significance\n\n"
             
             f"**PERSONAL PLANETS**\n"
-            f"5. Mercury — Communication and thinking style\n"
-            f"6. Venus — Love, relationships, values\n"
-            f"7. Mars — Drive, passion, action\n"
-            f"8. Jupiter — Growth and expansion\n"
-            f"9. Saturn — Discipline and challenges\n\n"
+            f"5. Mercury — Communication style, thinking patterns, learning style\n"
+            f"6. Venus — Love language, relationships, values, aesthetics\n"
+            f"7. Mars — Drive, passion, action style, ambition\n"
+            f"8. Jupiter — Growth, expansion, luck, philosophy\n"
+            f"9. Saturn — Discipline, responsibility, challenges, life lessons\n\n"
             
             f"**ASPECTS & ELEMENTS**\n"
-            f"10. Major Planetary Aspects\n"
-            f"11. Dominant Elements (Fire/Earth/Air/Water)\n"
-            f"12. House Placements\n\n"
+            f"10. Major Planetary Aspects — Conjunctions, oppositions, trines, squares\n"
+            f"11. Dominant Elements — Fire/Earth/Air/Water balance and meaning\n"
+            f"12. House Placements — Life areas emphasized (career, relationships, home, etc.)\n\n"
             
             f"**LIFE PATH**\n"
-            f"13. Personality Synthesis\n"
-            f"14. Life Purpose and Strengths\n"
-            f"15. Compatibility\n\n"
+            f"13. Personality Synthesis — Integrated overview combining all placements\n"
+            f"14. Life Purpose and Strengths — Karmic lessons, life mission\n"
+            f"15. Compatibility — Which signs and elements harmonize well\n\n"
             
             f"**PERSONALITY TYPOLOGY**\n"
-            f"16. MBTI Type (with reasoning)\n"
-            f"17. Enneagram (Core Type, Wing, Tritype, Instinctual Variant)\n"
-            f"18. Big Five Traits (scores 1-10)\n\n"
+            f"16. MBTI Type — Most likely type with detailed reasoning (I/E, N/S, T/F, J/P)\n"
+            f"17. Enneagram — Core Type (1-9), Wing, Tritype, Instinctual Variant (SP/SO/SX)\n"
+            f"18. Big Five Traits — Openness, Conscientiousness, Extraversion, Agreeableness, Neuroticism (scores 1-10)\n\n"
             
-            f"Be detailed and insightful for each section."
+            f"Be thorough, detailed, and insightful for each section. Provide specific examples and practical insights."
         )
 
         try:
@@ -275,7 +275,7 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                     "Structure your response clearly with each section labeled and numbered. "
                     "Be thorough, insightful, and specific."
                 ),
-                max_tokens=6000,  # Balanced token limit for comprehensive analysis
+                max_tokens=5000,  # Testing detailed analysis limits
             )
             
             # Smart chunking: Split the response into max 5 pages
@@ -438,6 +438,237 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                     "Birth Chart Error",
                     f"🌙 An unexpected error occurred:\n```\n{error_details[:1000]}\n```\n\n"
                     "Please try again with valid birth information (YYYY-MM-DD, HH:MM format)."
+                )
+            )
+
+
+    @app_commands.command(name="transits", description="Get current planetary transits for your birth chart")
+    @app_commands.describe(
+        date="Your birth date (YYYY-MM-DD, e.g., 1990-01-15)",
+        time="Your birth time (HH:MM, e.g., 14:30)",
+        location="Your birth location (city name)",
+        period="Time period for transit forecast (daily, weekly, or monthly)"
+    )
+    @app_commands.choices(period=[
+        app_commands.Choice(name="Daily (Today)", value="daily"),
+        app_commands.Choice(name="Weekly (This Week)", value="weekly"),
+        app_commands.Choice(name="Monthly (This Month)", value="monthly"),
+    ])
+    async def transits(
+        self,
+        interaction: discord.Interaction,
+        date: str,
+        time: str,
+        location: str,
+        period: str = "weekly"
+    ):
+        """Analyze current planetary transits affecting your birth chart."""
+        await interaction.response.defer()
+        
+        from datetime import datetime as dt
+        current_date = dt.now().strftime("%Y-%m-%d")
+        
+        period_labels = {
+            "daily": "Today",
+            "weekly": "This Week",
+            "monthly": "This Month"
+        }
+        
+        prompt = (
+            f"Analyze the current planetary transits for someone born:\n"
+            f"Birth Date: {date}\n"
+            f"Birth Time: {time}\n"
+            f"Birth Location: {location}\n\n"
+            f"Current Date: {current_date}\n"
+            f"Forecast Period: {period_labels[period]}\n\n"
+            f"Provide a detailed transit forecast covering:\n\n"
+            f"**CURRENT TRANSITS**\n"
+            f"1. Major Planetary Transits — Which planets are transiting which houses/natal planets\n"
+            f"2. Most Significant Aspects — Key transit aspects (conjunctions, oppositions, squares, trines)\n"
+            f"3. Transit Themes — Overall energy and themes for this period\n\n"
+            f"**LIFE AREAS ACTIVATED**\n"
+            f"4. Career & Ambition — Professional opportunities and challenges\n"
+            f"5. Relationships & Love — Romantic and social dynamics\n"
+            f"6. Personal Growth — Inner development and spiritual themes\n"
+            f"7. Health & Vitality — Physical and emotional well-being\n\n"
+            f"**TIMING & GUIDANCE**\n"
+            f"8. Best Days — Most favorable days for important activities\n"
+            f"9. Challenging Days — Days requiring extra caution or patience\n"
+            f"10. Opportunities — What to focus on and take advantage of\n"
+            f"11. Warnings — What to avoid or be mindful of\n\n"
+            f"**PRACTICAL ADVICE**\n"
+            f"12. Action Steps — Specific recommendations for this period\n"
+            f"13. Affirmations — Supportive mantras aligned with current energy\n\n"
+            f"Be specific, practical, and insightful. Focus on actionable guidance."
+        )
+        
+        try:
+            resp = await self.bot.llm.simple_prompt(
+                prompt,
+                system=(
+                    "You are an expert astrologer specializing in transit analysis. "
+                    "Provide practical, insightful forecasts that help people navigate current energies. "
+                    "Be specific about timing and actionable in your guidance."
+                ),
+                max_tokens=3000,
+            )
+            
+            content = resp.content
+            
+            # Create embed
+            embed = discord.Embed(
+                title=f"🔮 Transit Forecast — {period_labels[period]}",
+                description=content[:4000],  # Discord limit
+                color=discord.Color.purple(),
+            )
+            embed.add_field(name="Birth Date", value=date, inline=True)
+            embed.add_field(name="Birth Time", value=time, inline=True)
+            embed.add_field(name="Location", value=location, inline=True)
+            embed.set_footer(text=f"Current transits for {current_date} • AI-generated forecast")
+            
+            await interaction.followup.send(embed=embed)
+            
+        except LLMClientError as e:
+            logger.error("Transit forecast LLM error: %s", e)
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Transit Forecast Error",
+                    f"🔮 Could not generate transit forecast: {str(e)}\n\n"
+                    "Please try again with valid birth information."
+                )
+            )
+        except Exception as exc:
+            logger.error("Unexpected transit error: %s", exc, exc_info=True)
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Transit Forecast Error",
+                    f"🔮 An unexpected error occurred: {type(exc).__name__}\n\n"
+                    "Please try again."
+                )
+            )
+    
+    @app_commands.command(name="compatibility", description="Analyze astrological compatibility between two people")
+    @app_commands.describe(
+        your_date="Your birth date (YYYY-MM-DD)",
+        your_time="Your birth time (HH:MM)",
+        your_location="Your birth location",
+        partner_date="Partner's birth date (YYYY-MM-DD)",
+        partner_time="Partner's birth time (HH:MM)",
+        partner_location="Partner's birth location"
+    )
+    async def compatibility(
+        self,
+        interaction: discord.Interaction,
+        your_date: str,
+        your_time: str,
+        your_location: str,
+        partner_date: str,
+        partner_time: str,
+        partner_location: str
+    ):
+        """Analyze synastry and compatibility between two birth charts."""
+        await interaction.response.defer()
+        
+        prompt = (
+            f"Perform a detailed synastry and compatibility analysis between:\n\n"
+            f"**Person 1:**\n"
+            f"Birth Date: {your_date}\n"
+            f"Birth Time: {your_time}\n"
+            f"Birth Location: {your_location}\n\n"
+            f"**Person 2:**\n"
+            f"Birth Date: {partner_date}\n"
+            f"Birth Time: {partner_time}\n"
+            f"Birth Location: {partner_location}\n\n"
+            f"Provide a comprehensive compatibility analysis covering:\n\n"
+            f"**OVERALL COMPATIBILITY**\n"
+            f"1. Compatibility Score — Overall rating (1-10) with explanation\n"
+            f"2. Relationship Dynamic — Core energy and interaction style\n"
+            f"3. Soul Connection — Karmic ties and spiritual bond\n\n"
+            f"**SYNASTRY ASPECTS**\n"
+            f"4. Sun-Moon Connections — Emotional and ego compatibility\n"
+            f"5. Venus-Mars Aspects — Romantic and sexual chemistry\n"
+            f"6. Mercury Connections — Communication and mental rapport\n"
+            f"7. Major Challenging Aspects — Areas of friction and growth\n"
+            f"8. Harmonious Aspects — Natural strengths and ease\n\n"
+            f"**RELATIONSHIP AREAS**\n"
+            f"9. Communication — How you understand each other\n"
+            f"10. Emotional Connection — Feelings and nurturing\n"
+            f"11. Romance & Passion — Love language and attraction\n"
+            f"12. Shared Values — What you both care about\n"
+            f"13. Long-term Potential — Sustainability and growth\n\n"
+            f"**STRENGTHS & CHALLENGES**\n"
+            f"14. Relationship Strengths — What works naturally\n"
+            f"15. Growth Areas — Where effort is needed\n"
+            f"16. Advice for Harmony — How to nurture the connection\n\n"
+            f"Be honest, balanced, and constructive. Highlight both strengths and challenges."
+        )
+        
+        try:
+            resp = await self.bot.llm.simple_prompt(
+                prompt,
+                system=(
+                    "You are an expert relationship astrologer specializing in synastry analysis. "
+                    "Provide balanced, honest assessments that highlight both strengths and challenges. "
+                    "Be constructive and focus on how the relationship can thrive."
+                ),
+                max_tokens=4000,
+            )
+            
+            content = resp.content
+            
+            # Split into multiple embeds if needed
+            chunk_size = 3900
+            chunks = []
+            current_chunk = ""
+            
+            lines = content.split('\n')
+            for line in lines:
+                if len(current_chunk) + len(line) + 1 > chunk_size:
+                    if current_chunk:
+                        chunks.append(current_chunk.strip())
+                    current_chunk = line + '\n'
+                else:
+                    current_chunk += line + '\n'
+            
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            
+            # Send embeds
+            for i, chunk in enumerate(chunks, 1):
+                if i == 1:
+                    embed = discord.Embed(
+                        title=f"💕 Compatibility Analysis — Part {i}/{len(chunks)}",
+                        description=chunk,
+                        color=discord.Color.from_rgb(255, 105, 180),  # Hot pink
+                    )
+                    embed.add_field(name="Person 1", value=f"{your_date} • {your_location}", inline=True)
+                    embed.add_field(name="Person 2", value=f"{partner_date} • {partner_location}", inline=True)
+                else:
+                    embed = discord.Embed(
+                        title=f"💕 Compatibility Analysis — Part {i}/{len(chunks)}",
+                        description=chunk,
+                        color=discord.Color.from_rgb(255, 105, 180),
+                    )
+                
+                embed.set_footer(text="Synastry analysis • AI-generated compatibility reading")
+                await interaction.followup.send(embed=embed)
+            
+        except LLMClientError as e:
+            logger.error("Compatibility LLM error: %s", e)
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Compatibility Error",
+                    f"💕 Could not generate compatibility analysis: {str(e)}\n\n"
+                    "Please try again with valid birth information for both people."
+                )
+            )
+        except Exception as exc:
+            logger.error("Unexpected compatibility error: %s", exc, exc_info=True)
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Compatibility Error",
+                    f"💕 An unexpected error occurred: {type(exc).__name__}\n\n"
+                    "Please try again."
                 )
             )
 
