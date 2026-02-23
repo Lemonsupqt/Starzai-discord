@@ -24,6 +24,7 @@ from config.constants import (
 from utils.embedder import Embedder
 from utils.llm_client import LLMClient, LLMClientError
 from utils.analysis_view import AnalysisView, create_analysis_embeds, format_full_report
+from utils.analysis_helpers import multi_agent_analysis
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
@@ -537,12 +538,22 @@ class ChatCog(commands.Cog, name="Chat"):
         description="🔥 ULTIMATE personality analysis with 5000+ messages & interactive pages"
     )
     @app_commands.describe(
-        user="The user to analyze"
+        user="The user to analyze",
+        analysis_type="Psychology framework: trait_theory, freudian, jungian, humanistic, cognitive_behavioral, mbti"
     )
+    @app_commands.choices(analysis_type=[
+        app_commands.Choice(name="🎨 Big Five Traits (Default)", value="trait_theory"),
+        app_commands.Choice(name="🔬 Freudian Psychoanalysis", value="freudian"),
+        app_commands.Choice(name="🎭 Jungian Psychology", value="jungian"),
+        app_commands.Choice(name="🌟 Humanistic (Maslow/Rogers)", value="humanistic"),
+        app_commands.Choice(name="🧩 Cognitive-Behavioral", value="cognitive_behavioral"),
+        app_commands.Choice(name="💼 MBTI-Style", value="mbti"),
+    ])
     async def analyze_user(
         self,
         interaction: discord.Interaction,
-        user: discord.Member
+        user: discord.Member,
+        analysis_type: str = "trait_theory"
     ) -> None:
         """Create comprehensive personality analysis with deep message search and pagination."""
         await interaction.response.defer(ephemeral=True)
@@ -591,53 +602,29 @@ class ChatCog(commands.Cog, name="Chat"):
             
             # Prepare comprehensive analysis prompt
             # Sample messages from different time periods
-            sample_size = min(100, len(messages))
-            step = max(1, len(messages) // sample_size)
-            message_samples = "\n".join([
-                f"- {messages[i]['content'][:200]}" 
-                for i in range(0, len(messages), step)
-            ][:100])
-            
-            analysis_prompt = f"""Analyze this Discord user comprehensively based on {len(messages):,} messages.
-
-User: {user.display_name}
-Server: {interaction.guild.name}
-Messages: {len(messages):,}
-
-Sample messages (chronologically distributed):
-{message_samples}
-
-Provide a DETAILED analysis in the following JSON-like structure:
-
-{{
-  "overview": "2-3 sentence high-level summary of who they are",
-  "communication_style": "How they express themselves (tone, length, emoji use, formatting). Use bullet points.",
-  "personality_traits": "Key personality characteristics observed. Use bullet points with emojis.",
-  "interests": "Main topics and interests they discuss. Use bullet points with emojis.",
-  "behavioral_patterns": "Notable habits, patterns, or quirks. Use bullet points.",
-  "activity_patterns": "When/how often they post, engagement level. Use bullet points.",
-  "social_dynamics": "How they interact with others, social role in server. Use bullet points.",
-  "vocabulary": "Unique phrases, favorite words, linguistic style. Use bullet points.",
-  "unique_insights": "Interesting observations that stand out. Use bullet points with emojis."
-}}
-
-Make it insightful, respectful, and engaging. Use Discord markdown formatting (**bold**, *italic*, `code`).
-Focus on observable patterns, not judgments. Be specific with examples when possible."""
-
-            # Get analysis from LLM
+            # Get model
             model = await self._resolve_model(interaction.user.id)
-            analysis_text = ""
             
-            async for chunk in self.bot.llm.chat_stream(
-                [{"role": "user", "content": analysis_prompt}],
-                model=model
-            ):
-                analysis_text += chunk
+            # Progress callback for multi-agent pipeline
+            async def update_progress(status: str):
+                try:
+                    await progress_msg.edit(content=status)
+                except:
+                    pass
             
-            # Parse the analysis (try to extract JSON-like structure)
-            analysis_data = self._parse_analysis_response(analysis_text)
+            # Run MULTI-AGENT ANALYSIS PIPELINE
+            # This ensures NO EMPTY RESPONSES and high quality for each section
+            analysis_data = await multi_agent_analysis(
+                self.bot.llm,
+                messages,
+                user.display_name,
+                model,
+                analysis_type,
+                progress_callback=update_progress
+            )
             
             # BONUS: Analyze top 3 channels for channel-specific insights
+            await update_progress("🎯 Analyzing top 3 channels...")
             top_channels = self._get_top_channels(messages, top_n=3)
             if top_channels:
                 channel_insights = await self._analyze_top_channels(

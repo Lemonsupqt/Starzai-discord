@@ -169,6 +169,71 @@ class AnalysisView(discord.ui.View):
                 pass
 
 
+class AnalysisTypeModal(discord.ui.Modal, title="Choose Analysis Type"):
+    """Modal for selecting psychoanalysis framework."""
+    
+    analysis_type = discord.ui.TextInput(
+        label="Analysis Framework",
+        placeholder="freudian, jungian, humanistic, cognitive_behavioral, trait_theory, mbti",
+        default="trait_theory",
+        max_length=50,
+        style=discord.TextStyle.short
+    )
+    
+    model_input = discord.ui.TextInput(
+        label="Model Name (optional)",
+        placeholder="e.g., gpt-4, claude-3-opus (leave blank for default)",
+        required=False,
+        max_length=50,
+        style=discord.TextStyle.short
+    )
+    
+    def __init__(self, analyze_callback: Callable, messages: List[Dict[str, Any]], user_name: str):
+        super().__init__()
+        self.analyze_callback = analyze_callback
+        self.messages = messages
+        self.user_name = user_name
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        """Handle analysis type selection."""
+        analysis_type = self.analysis_type.value.strip().lower()
+        model = self.model_input.value.strip() if self.model_input.value else None
+        
+        # Validate analysis type
+        valid_types = ["freudian", "jungian", "humanistic", "cognitive_behavioral", "trait_theory", "mbti"]
+        if analysis_type not in valid_types:
+            await interaction.response.send_message(
+                f"❌ Invalid analysis type. Choose from: {', '.join(valid_types)}",
+                ephemeral=True
+            )
+            return
+        
+        type_names = {
+            "freudian": "Freudian Psychoanalysis",
+            "jungian": "Jungian Analytical Psychology",
+            "humanistic": "Humanistic Psychology",
+            "cognitive_behavioral": "Cognitive-Behavioral Analysis",
+            "trait_theory": "Big Five Trait Theory",
+            "mbti": "MBTI-Style Analysis"
+        }
+        
+        await interaction.response.send_message(
+            f"🧠 **Analyzing {self.user_name} with {type_names[analysis_type]}...**\n"
+            f"⏳ Running multi-agent analysis pipeline (6 specialized agents)...\n"
+            f"📊 This will take 2-3 minutes for maximum quality...",
+            ephemeral=True
+        )
+        
+        # Call the analysis callback
+        try:
+            await self.analyze_callback(interaction, analysis_type, model, self.messages, self.user_name)
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Error during analysis: {str(e)}",
+                ephemeral=True
+            )
+
+
 class ModelSelectionModal(discord.ui.Modal, title="Re-analyze with Different Model"):
     """Modal for selecting a different AI model for re-analysis."""
     
@@ -278,17 +343,33 @@ def generate_pdf_report(
     story.append(Paragraph(f"Messages Analyzed: {message_count:,}", subtitle_style))
     story.append(Spacer(1, 0.3*inch))
     
+    # Add word frequency data if available
+    word_freq = analysis_data.get('word_frequency_data', {})
+    if word_freq:
+        story.append(Paragraph("Word Frequency Statistics", heading_style))
+        stats_text = f"""Total Words: {word_freq.get('total_words', 0):,}<br/>
+Unique Words: {word_freq.get('unique_words', 0):,}<br/>
+Vocabulary Richness: {word_freq.get('vocabulary_richness', 0):.2%}"""
+        story.append(Paragraph(stats_text, body_style))
+        
+        if 'top_words' in word_freq:
+            story.append(Paragraph("Top 20 Most Used Words:", heading_style))
+            top_words_text = "<br/>".join([
+                f"{i}. {word}: {count} times" 
+                for i, (word, count) in enumerate(word_freq['top_words'][:20], 1)
+            ])
+            story.append(Paragraph(top_words_text, body_style))
+            story.append(Spacer(1, 0.2*inch))
+    
     # Sections
+    analysis_type = analysis_data.get('analysis_type', 'Standard')
     sections = [
-        ("📝 Overview", "overview"),
+        ("🔤 Vocabulary & Linguistic Analysis", "vocabulary_analysis"),
         ("💬 Communication Style", "communication_style"),
-        ("✨ Personality Traits", "personality_traits"),
-        ("🎯 Interests & Topics", "interests"),
-        ("🔄 Behavioral Patterns", "behavioral_patterns"),
-        ("⏰ Activity Patterns", "activity_patterns"),
+        (f"🧠 Psychological Profile ({analysis_type})", "psychological_profile"),
         ("👥 Social Dynamics", "social_dynamics"),
-        ("📚 Vocabulary & Expression", "vocabulary"),
-        ("💡 Unique Insights", "unique_insights"),
+        ("🔄 Behavioral Patterns", "behavioral_patterns"),
+        ("✨ Synthesis & Unique Insights", "synthesis_insights"),
     ]
     
     for section_title, section_key in sections:
@@ -311,6 +392,7 @@ def generate_pdf_report(
 def create_analysis_embeds(analysis_data: Dict[str, Any], user_name: str, message_count: int) -> List[discord.Embed]:
     """
     Create beautiful paginated embeds from analysis data.
+    NO CHARACTER LIMITS - full quality analysis.
     
     Args:
         analysis_data: Comprehensive analysis data
@@ -321,121 +403,125 @@ def create_analysis_embeds(analysis_data: Dict[str, Any], user_name: str, messag
         List of formatted embed pages
     """
     pages = []
+    analysis_type = analysis_data.get("analysis_type", "Standard")
     
-    # Page 1: Overview & Communication Style
+    # Helper function to split long text into multiple fields
+    def add_long_field(embed, name, value, max_length=1024):
+        """Add field, splitting into multiple if needed."""
+        if not value:
+            return
+        
+        # If short enough, add as single field
+        if len(value) <= max_length:
+            embed.add_field(name=name, value=value, inline=False)
+            return
+        
+        # Split into chunks
+        chunks = []
+        current_chunk = ""
+        
+        # Split by paragraphs first
+        paragraphs = value.split('\n\n')
+        for para in paragraphs:
+            if len(current_chunk) + len(para) + 2 <= max_length:
+                current_chunk += para + "\n\n"
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = para + "\n\n"
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        # Add first chunk with name, rest with continuation
+        for i, chunk in enumerate(chunks):
+            field_name = name if i == 0 else f"{name} (cont.)"
+            embed.add_field(name=field_name, value=chunk, inline=False)
+    
+    # Page 1: Vocabulary Analysis
     embed1 = discord.Embed(
         title=f"📊 Analysis: {user_name}",
-        description=f"**Comprehensive personality and behavior analysis**\n*Based on {message_count:,} messages*",
+        description=f"**{analysis_type} Analysis**\n*Based on {message_count:,} messages*",
         color=discord.Color.blue()
     )
     
-    if "overview" in analysis_data:
-        embed1.add_field(
-            name="📝 Overview",
-            value=analysis_data["overview"][:1024],
-            inline=False
-        )
+    if "vocabulary_analysis" in analysis_data:
+        add_long_field(embed1, "🔤 Vocabulary & Linguistic Patterns", analysis_data["vocabulary_analysis"])
     
-    if "communication_style" in analysis_data:
-        embed1.add_field(
-            name="💬 Communication Style",
-            value=analysis_data["communication_style"][:1024],
-            inline=False
-        )
-    
-    embed1.set_footer(text="Page 1 • Use buttons below to navigate")
+    embed1.set_footer(text="Page 1 • Full quality analysis, no limits")
     pages.append(embed1)
     
-    # Page 2: Personality & Interests
+    # Page 2: Communication Style
     embed2 = discord.Embed(
-        title=f"🎭 Personality Profile: {user_name}",
+        title=f"💬 Communication Style: {user_name}",
         color=discord.Color.green()
     )
     
-    if "personality_traits" in analysis_data:
-        embed2.add_field(
-            name="✨ Personality Traits",
-            value=analysis_data["personality_traits"][:1024],
-            inline=False
-        )
+    if "communication_style" in analysis_data:
+        add_long_field(embed2, "💬 Communication Patterns", analysis_data["communication_style"])
     
-    if "interests" in analysis_data:
-        embed2.add_field(
-            name="🎯 Interests & Topics",
-            value=analysis_data["interests"][:1024],
-            inline=False
-        )
-    
-    embed2.set_footer(text="Page 2 • Use buttons below to navigate")
+    embed2.set_footer(text="Page 2 • Full quality analysis, no limits")
     pages.append(embed2)
     
-    # Page 3: Behavior & Activity
+    # Page 3: Psychological Profile
     embed3 = discord.Embed(
-        title=f"📈 Behavioral Analysis: {user_name}",
+        title=f"🧠 Psychological Profile: {user_name}",
+        description=f"*{analysis_type} Framework*",
         color=discord.Color.purple()
     )
     
-    if "behavioral_patterns" in analysis_data:
-        embed3.add_field(
-            name="🔄 Behavioral Patterns",
-            value=analysis_data["behavioral_patterns"][:1024],
-            inline=False
-        )
+    if "psychological_profile" in analysis_data:
+        add_long_field(embed3, f"🧠 {analysis_type} Analysis", analysis_data["psychological_profile"])
     
-    if "activity_patterns" in analysis_data:
-        embed3.add_field(
-            name="⏰ Activity Patterns",
-            value=analysis_data["activity_patterns"][:1024],
-            inline=False
-        )
-    
-    embed3.set_footer(text="Page 3 • Use buttons below to navigate")
+    embed3.set_footer(text="Page 3 • Full quality analysis, no limits")
     pages.append(embed3)
     
-    # Page 4: Social Dynamics & Insights
+    # Page 4: Social Dynamics
     embed4 = discord.Embed(
-        title=f"🤝 Social Dynamics: {user_name}",
+        title=f"👥 Social Dynamics: {user_name}",
         color=discord.Color.orange()
     )
     
     if "social_dynamics" in analysis_data:
-        embed4.add_field(
-            name="👥 Social Interactions",
-            value=analysis_data["social_dynamics"][:1024],
-            inline=False
-        )
+        add_long_field(embed4, "👥 Relationships & Interactions", analysis_data["social_dynamics"])
     
-    if "unique_insights" in analysis_data:
-        embed4.add_field(
-            name="💡 Unique Insights",
-            value=analysis_data["unique_insights"][:1024],
-            inline=False
-        )
+    embed4.set_footer(text="Page 4 • Full quality analysis, no limits")
+    pages.append(embed4)
     
-    if "vocabulary" in analysis_data:
-        embed4.add_field(
-            name="📚 Vocabulary & Expression",
-            value=analysis_data["vocabulary"][:1024],
-            inline=False
-        )
+    # Page 5: Behavioral Patterns
+    embed5 = discord.Embed(
+        title=f"🔄 Behavioral Patterns: {user_name}",
+        color=discord.Color.gold()
+    )
     
-    # Add channel-specific insights if available
+    if "behavioral_patterns" in analysis_data:
+        add_long_field(embed5, "🔄 Habits & Patterns", analysis_data["behavioral_patterns"])
+    
+    embed5.set_footer(text="Page 5 • Full quality analysis, no limits")
+    pages.append(embed5)
+    
+    # Page 6: Synthesis & Unique Insights
+    embed6 = discord.Embed(
+        title=f"✨ Synthesis & Insights: {user_name}",
+        color=discord.Color.magenta()
+    )
+    
+    if "synthesis_insights" in analysis_data:
+        add_long_field(embed6, "✨ Unique Insights & Core Identity", analysis_data["synthesis_insights"])
+    
+    embed6.set_footer(text="Page 6 • Full quality analysis, no limits")
+    pages.append(embed6)
+    
+    # Page 7: Channel-Specific Insights (if available)
     if "channel_insights" in analysis_data and analysis_data["channel_insights"]:
-        embed5 = discord.Embed(
+        embed7 = discord.Embed(
             title=f"🎯 Channel-Specific Insights: {user_name}",
             description="*Behavior analysis in top 3 most active channels*",
             color=discord.Color.teal()
         )
-        embed5.add_field(
-            name="📍 Top Channels Analysis",
-            value=analysis_data["channel_insights"][:4000],
-            inline=False
-        )
-        embed5.set_footer(text="Page 5 • Channel-specific behavior patterns")
-        pages.append(embed5)
-    
-    embed4.set_footer(text=f"Page 4 • Download PDF/TXT for complete details")
-    pages.append(embed4)
+        add_long_field(embed7, "📍 Top Channels Analysis", analysis_data["channel_insights"])
+        embed7.set_footer(text="Page 7 • Channel-specific behavior patterns")
+        pages.append(embed7)
     
     return pages
 
@@ -443,6 +529,7 @@ def create_analysis_embeds(analysis_data: Dict[str, Any], user_name: str, messag
 def format_full_report(analysis_data: Dict[str, Any], user_name: str, message_count: int) -> str:
     """
     Format complete analysis as downloadable text report.
+    NO CHARACTER LIMITS - full quality.
     
     Args:
         analysis_data: Comprehensive analysis data
@@ -452,57 +539,77 @@ def format_full_report(analysis_data: Dict[str, Any], user_name: str, message_co
     Returns:
         Formatted text report
     """
+    analysis_type = analysis_data.get('analysis_type', 'Standard')
+    word_freq = analysis_data.get('word_frequency_data', {})
+    
     report = f"""
 ╔══════════════════════════════════════════════════════════════╗
 ║          COMPREHENSIVE USER ANALYSIS REPORT                  ║
 ╚══════════════════════════════════════════════════════════════╝
 
 User: {user_name}
+Analysis Type: {analysis_type}
 Messages Analyzed: {message_count:,}
 Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
 
 ═══════════════════════════════════════════════════════════════
+WORD FREQUENCY STATISTICS
+═══════════════════════════════════════════════════════════════
+Total Words: {word_freq.get('total_words', 0):,}
+Unique Words: {word_freq.get('unique_words', 0):,}
+Vocabulary Richness: {word_freq.get('vocabulary_richness', 0):.2%}
 
-📝 OVERVIEW
+Top 30 Most Used Words:
+"""
+    
+    # Add top words
+    if 'top_words' in word_freq:
+        for i, (word, count) in enumerate(word_freq['top_words'][:30], 1):
+            report += f"{i}. {word}: {count} times\n"
+    
+    report += f"""
+═══════════════════════════════════════════════════════════════
+
+🔤 VOCABULARY & LINGUISTIC ANALYSIS
 ───────────────────────────────────────────────────────────────
-{analysis_data.get('overview', 'N/A')}
+{analysis_data.get('vocabulary_analysis', 'N/A')}
+
+═══════════════════════════════════════════════════════════════
 
 💬 COMMUNICATION STYLE
 ───────────────────────────────────────────────────────────────
 {analysis_data.get('communication_style', 'N/A')}
 
-✨ PERSONALITY TRAITS
-───────────────────────────────────────────────────────────────
-{analysis_data.get('personality_traits', 'N/A')}
+═══════════════════════════════════════════════════════════════
 
-🎯 INTERESTS & TOPICS
+🧠 PSYCHOLOGICAL PROFILE ({analysis_type})
 ───────────────────────────────────────────────────────────────
-{analysis_data.get('interests', 'N/A')}
+{analysis_data.get('psychological_profile', 'N/A')}
 
-🔄 BEHAVIORAL PATTERNS
-───────────────────────────────────────────────────────────────
-{analysis_data.get('behavioral_patterns', 'N/A')}
-
-⏰ ACTIVITY PATTERNS
-───────────────────────────────────────────────────────────────
-{analysis_data.get('activity_patterns', 'N/A')}
+═══════════════════════════════════════════════════════════════
 
 👥 SOCIAL DYNAMICS
 ───────────────────────────────────────────────────────────────
 {analysis_data.get('social_dynamics', 'N/A')}
 
-📚 VOCABULARY & EXPRESSION
-───────────────────────────────────────────────────────────────
-{analysis_data.get('vocabulary', 'N/A')}
+═══════════════════════════════════════════════════════════════
 
-💡 UNIQUE INSIGHTS
+🔄 BEHAVIORAL PATTERNS
 ───────────────────────────────────────────────────────────────
-{analysis_data.get('unique_insights', 'N/A')}
+{analysis_data.get('behavioral_patterns', 'N/A')}
+
+═══════════════════════════════════════════════════════════════
+
+✨ SYNTHESIS & UNIQUE INSIGHTS
+───────────────────────────────────────────────────────────────
+{analysis_data.get('synthesis_insights', 'N/A')}
 """
     
     # Add channel insights if available
     if "channel_insights" in analysis_data and analysis_data["channel_insights"]:
         report += f"""
+═══════════════════════════════════════════════════════════════
+
 🎯 CHANNEL-SPECIFIC INSIGHTS
 ───────────────────────────────────────────────────────────────
 {analysis_data['channel_insights']}
@@ -514,4 +621,3 @@ End of Report
 ═══════════════════════════════════════════════════════════════
 """
     return report
-
