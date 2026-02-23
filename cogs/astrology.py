@@ -4,6 +4,7 @@ Astrology & Zodiac cog — Horoscopes and birth chart analysis.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, List
@@ -245,11 +246,15 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         chart_data = None
         if self.astro_calc and ASTRO_AVAILABLE:
             try:
-                chart_data = self.astro_calc.calculate_birth_chart(date, time, location)
+                chart_data = await self.astro_calc.calculate_birth_chart(date, time, location)
                 if chart_data:
                     logger.info(f"Calculated real birth chart for {date} {time} {location}")
+                else:
+                    logger.warning(f"Could not calculate chart - likely geocoding failed for '{location}'")
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout calculating birth chart for {location}")
             except Exception as e:
-                logger.error(f"Birth chart calculation error: {e}")
+                logger.error(f"Birth chart calculation error: {e}", exc_info=True)
         
         # Build prompt with real data if available
         if chart_data:
@@ -515,7 +520,7 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         transit_data = None
         if self.astro_calc and ASTRO_AVAILABLE:
             try:
-                natal_chart = self.astro_calc.calculate_birth_chart(date, time, location)
+                natal_chart = await self.astro_calc.calculate_birth_chart(date, time, location)
                 if natal_chart:
                     transit_data = self.astro_calc.calculate_transits(natal_chart, current_date)
                     logger.info(f"Calculated real transits for {date}")
@@ -700,8 +705,8 @@ class AstrologyCog(commands.Cog, name="Astrology"):
         
         if self.astro_calc and ASTRO_AVAILABLE:
             try:
-                chart1 = self.astro_calc.calculate_birth_chart(your_date, your_time, your_location)
-                chart2 = self.astro_calc.calculate_birth_chart(partner_date, partner_time, partner_location)
+                chart1 = await self.astro_calc.calculate_birth_chart(your_date, your_time, your_location)
+                chart2 = await self.astro_calc.calculate_birth_chart(partner_date, partner_time, partner_location)
                 
                 if chart1 and chart2:
                     synastry_aspects = self.astro_calc.calculate_synastry(chart1, chart2)

@@ -1,13 +1,16 @@
 """
 Real astronomical calculations using Swiss Ephemeris.
 Provides accurate planetary positions, houses, aspects, and transits.
+Optimized with caching and async support.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
 try:
@@ -20,6 +23,9 @@ except ImportError:
     swe = None
 
 logger = logging.getLogger("starzai.astro")
+
+# Global geocoding cache (locations don't change!)
+_geocode_cache: Dict[str, Tuple[float, float]] = {}
 
 # Planet constants
 PLANETS = {
@@ -115,15 +121,32 @@ class AstroCalculator:
         # Set ephemeris path (uses built-in data)
         swe.set_ephe_path(None)
     
-    def get_coordinates(self, location: str) -> Optional[Tuple[float, float]]:
-        """Convert location name to latitude/longitude."""
+    async def get_coordinates(self, location: str) -> Optional[Tuple[float, float]]:
+        """Convert location name to latitude/longitude with caching."""
         if not ASTRO_AVAILABLE:
             return None
         
+        # Check cache first
+        location_key = location.lower().strip()
+        if location_key in _geocode_cache:
+            logger.debug(f"Using cached coordinates for '{location}'")
+            return _geocode_cache[location_key]
+        
         try:
-            loc = self.geocoder.geocode(location, timeout=10)
+            # Run geocoding in thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            loc = await loop.run_in_executor(
+                None, 
+                lambda: self.geocoder.geocode(location, timeout=5)
+            )
+            
             if loc:
-                return (loc.latitude, loc.longitude)
+                coords = (loc.latitude, loc.longitude)
+                _geocode_cache[location_key] = coords  # Cache it!
+                logger.info(f"Geocoded '{location}' to {coords}")
+                return coords
+            
+            logger.warning(f"Could not geocode location: '{location}'")
             return None
         except Exception as e:
             logger.error(f"Geocoding error for '{location}': {e}")
@@ -243,14 +266,14 @@ class AstroCalculator:
         
         return aspects
     
-    def calculate_birth_chart(self, date: str, time: str, location: str) -> Optional[BirthChart]:
-        """Calculate complete birth chart."""
+    async def calculate_birth_chart(self, date: str, time: str, location: str) -> Optional[BirthChart]:
+        """Calculate complete birth chart (async for geocoding)."""
         if not ASTRO_AVAILABLE:
             logger.error("Swiss Ephemeris not available")
             return None
         
-        # Get coordinates
-        coords = self.get_coordinates(location)
+        # Get coordinates (async with caching)
+        coords = await self.get_coordinates(location)
         if not coords:
             logger.error(f"Could not geocode location: {location}")
             return None
@@ -370,4 +393,3 @@ class AstroCalculator:
             lines.append(str(aspect))
         
         return "\n".join(lines)
-
