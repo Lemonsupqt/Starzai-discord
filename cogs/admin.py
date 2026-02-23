@@ -165,7 +165,130 @@ class AdminCog(commands.Cog, name="Admin"):
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # ── /help ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="help", description="View all available commands and bot information")
+    async def help_cmd(self, interaction: discord.Interaction) -> None:
+        """Comprehensive help command showing all bot features."""
+        
+        # Main help embed
+        embed = discord.Embed(
+            title="✨ Starzai Bot - Command Guide",
+            description=(
+                "**Starzai** is an AI-powered Discord bot with conversational abilities, "
+                "utility features, and personalization.\n\n"
+                "Use the buttons below to explore different command categories!"
+            ),
+            color=discord.Color.blue(),
+        )
+        
+        embed.add_field(
+            name="🤖 AI Chat Commands",
+            value=(
+                "`/chat` - Send a message to the AI\n"
+                "`/ask` - Ask with a specific model\n"
+                "`/conversation start` - Begin a persistent conversation\n"
+                "`/conversation end` - End current conversation\n"
+                "`/conversation clear` - Clear conversation history\n"
+                "`/set-model` - Set your preferred AI model\n"
+                "`/models` - List all available models"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="🌍 Language & Text Tools",
+            value=(
+                "`/translate` - Translate text to another language\n"
+                "`/detect-language` - Detect the language of text\n"
+                "`/etymology` - Learn word origins and history\n"
+                "`/word-history` - Detailed word etymology\n"
+                "`/check-grammar` - Check grammar and spelling\n"
+                "`/improve-text` - Improve text style and clarity"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="⭐ Astrology & Personality",
+            value=(
+                "`/horoscope` - Get your daily/weekly/monthly horoscope\n"
+                "`/birth-chart` - Generate detailed birth chart\n"
+                "`/synastry` - Compatibility analysis between two people\n"
+                "`/analyze-personality` - Analyze personality from text"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="📁 File Analysis",
+            value=(
+                "`/analyze-file` - Analyze uploaded documents\n"
+                "`/summarize-file` - Summarize document content"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="🎮 Games & Fun",
+            value=(
+                "`/trivia` - Play trivia with different categories\n"
+                "`/word-game` - Interactive word games\n"
+                "`/riddle` - Solve riddles and puzzles"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="🔒 Privacy & Data",
+            value=(
+                "`/privacy` - View privacy policy\n"
+                "`/my-data` - See what data we store about you\n"
+                "`/forget-me` - Delete all your data (GDPR)"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="📊 User Commands",
+            value=(
+                "`/usage` - Check your usage statistics\n"
+                "`/help` - Show this help message"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="💡 Features",
+            value=(
+                "✅ **Multi-turn Conversations** - Context-aware AI chat\n"
+                "✅ **Personalization** - Remembers your preferences\n"
+                "✅ **Privacy-First** - GDPR compliant with data controls\n"
+                "✅ **Multiple AI Models** - Choose your preferred model\n"
+                "✅ **Real Astronomy** - Swiss Ephemeris calculations\n"
+                "✅ **30-Day Data Retention** - Automatic cleanup"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
+            name="🔗 Links & Support",
+            value=(
+                "• **Privacy Policy**: Use `/privacy` to view\n"
+                "• **Data Management**: Use `/my-data` to see your data\n"
+                "• **Support**: Contact bot owner for help"
+            ),
+            inline=False,
+        )
+        
+        embed.set_footer(
+            text="Starzai • AI-Powered Discord Bot • Use /privacy for data policy"
+        )
+        
+        embed.set_thumbnail(url=self.bot.user.avatar.url if self.bot.user.avatar else None)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 async def setup(bot: StarzaiBot) -> None:
     await bot.add_cog(AdminCog(bot))
-
