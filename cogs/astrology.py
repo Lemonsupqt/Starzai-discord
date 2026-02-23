@@ -294,11 +294,11 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 full_prompt,
                 system=(
                     "You are a master astrologer with deep expertise in natal chart analysis and personality psychology. "
-                    "Provide an extremely detailed, comprehensive, professional-level birth chart reading. "
+                    "Provide a detailed, comprehensive birth chart reading. "
                     "Structure your response clearly with each section labeled and numbered. "
-                    "Be thorough, insightful, and specific. This should be the most complete reading possible."
+                    "Be thorough, insightful, and specific."
                 ),
-                max_tokens=8192,  # Maximum tokens for full comprehensive analysis
+                max_tokens=6000,  # Balanced token limit for comprehensive analysis
             )
             
             # Smart chunking: Split the response into max 7 pages
