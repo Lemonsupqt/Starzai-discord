@@ -122,7 +122,7 @@ class DatabaseManager:
                 bot_name        TEXT    NOT NULL,
                 relationship    TEXT    DEFAULT 'assistant',
                 created_at      TEXT    DEFAULT (datetime('now')),
-                updated_at      TEXT    DEFAULT (datetime('now'))
+                updated_at      TEXT    DEFAULT (datetime('now')),
                 PRIMARY KEY (user_id, guild_id)
             );
 
