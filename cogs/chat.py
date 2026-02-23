@@ -38,7 +38,7 @@ SYSTEM_PROMPT = (
 
 # Extended system prompt template for @mention conversations with server context
 MENTION_SYSTEM_PROMPT = (
-    "You are Starzai, a friendly and knowledgeable AI assistant on Discord. "
+    "You are {bot_name}, {relationship} to {owner_name}. "
     "Be helpful, concise, and engaging. Use Discord markdown formatting: "
     "**bold**, *italic*, __underline__, ~~strikethrough~~, `code`, ```code blocks```. "
     "Keep responses natural and conversational. If you don't know something, say so honestly.\n\n"
@@ -46,7 +46,8 @@ MENTION_SYSTEM_PROMPT = (
     "The user talking to you is \"{user_display_name}\". "
     "When the user mentions other people by name in their messages, those are real users in the server — "
     "acknowledge them naturally. If recent message context is provided for mentioned users, use it to give "
-    "informed responses about their activity, personality, or recent topics they've discussed."
+    "informed responses about their activity, personality, or recent topics they've discussed. "
+    "If the user is replying to a message, that context will be provided to help you understand what they're responding to."
 )
 
 # Auto-expiry for @mention conversations (10 minutes of inactivity)
@@ -487,6 +488,155 @@ class ChatCog(commands.Cog, name="Chat"):
             ephemeral=True,
         )
 
+    @app_commands.command(
+        name="name-bot",
+        description="Give your bot a personalized name and relationship"
+    )
+    @app_commands.describe(
+        bot_name="What do you want to call your bot?",
+        relationship="What is your bot to you? (e.g., 'my assistant', 'my friend', 'my mentor')"
+    )
+    async def name_bot(
+        self,
+        interaction: discord.Interaction,
+        bot_name: str,
+        relationship: str = "my assistant"
+    ) -> None:
+        """Set a personalized name and relationship for your bot instance."""
+        user_id = str(interaction.user.id)
+        guild_id = str(interaction.guild_id) if interaction.guild_id else "0"
+        
+        # Validate inputs
+        if len(bot_name) > 50:
+            await interaction.response.send_message(
+                "❌ Bot name must be 50 characters or less!",
+                ephemeral=True
+            )
+            return
+        
+        if len(relationship) > 100:
+            await interaction.response.send_message(
+                "❌ Relationship description must be 100 characters or less!",
+                ephemeral=True
+            )
+            return
+        
+        # Store the bot identity
+        await self.bot.db.set_bot_identity(user_id, guild_id, bot_name, relationship)
+        
+        await interaction.response.send_message(
+            f"✅ **Bot identity set!**\n\n"
+            f"Your bot is now **{bot_name}**, {relationship}.\n"
+            f"They'll remember this when you talk to them! 🎭",
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="analyze",
+        description="Create a comprehensive personality analysis of a user"
+    )
+    @app_commands.describe(
+        user="The user to analyze"
+    )
+    async def analyze_user(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member
+    ) -> None:
+        """Analyze a user's messages and create a personality profile."""
+        await interaction.response.defer(ephemeral=True)
+        
+        if user.bot:
+            await interaction.followup.send(
+                "❌ I can't analyze bots!",
+                ephemeral=True
+            )
+            return
+        
+        target_user_id = str(user.id)
+        guild_id = str(interaction.guild_id) if interaction.guild_id else "0"
+        analyzer_id = str(interaction.user.id)
+        
+        try:
+            # Check if we have a recent analysis cached
+            cached_analysis = await self.bot.db.get_user_analysis(
+                target_user_id, guild_id, analyzer_id
+            )
+            
+            # Fetch messages from database (deep search)
+            messages = await self.bot.db.search_user_messages(
+                target_user_id, guild_id, limit=200
+            )
+            
+            if not messages:
+                await interaction.followup.send(
+                    f"❌ No message history found for {user.display_name}. "
+                    "They might not have sent many messages yet!",
+                    ephemeral=True
+                )
+                return
+            
+            # Prepare analysis prompt
+            message_samples = "\n".join([
+                f"- {msg['content'][:150]}" for msg in messages[:50]
+            ])
+            
+            analysis_prompt = f"""Analyze this Discord user based on their message history:
+
+User: {user.display_name}
+Messages analyzed: {len(messages)}
+Server: {interaction.guild.name if interaction.guild else 'Unknown'}
+
+Sample messages:
+{message_samples}
+
+Provide a comprehensive analysis including:
+1. **Communication Style**: How they express themselves
+2. **Personality Traits**: Key characteristics you observe
+3. **Interests & Topics**: What they talk about most
+4. **Behavioral Patterns**: Notable habits or patterns
+5. **Activity Level**: How active/engaged they are
+
+Keep it insightful but respectful. Focus on observable patterns, not judgments."""
+
+            # Get analysis from LLM
+            model = await self._resolve_model(interaction.user.id)
+            analysis_text = ""
+            
+            async for chunk in self.bot.llm.chat_stream(
+                [{"role": "user", "content": analysis_prompt}],
+                model=model
+            ):
+                analysis_text += chunk
+            
+            # Store the analysis
+            date_range = f"Last {len(messages)} messages"
+            await self.bot.db.store_user_analysis(
+                target_user_id,
+                guild_id,
+                analyzer_id,
+                {"analysis": analysis_text, "user_name": user.display_name},
+                len(messages),
+                date_range
+            )
+            
+            # Send the analysis
+            embed = discord.Embed(
+                title=f"📊 Analysis: {user.display_name}",
+                description=analysis_text[:4000],  # Discord embed limit
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text=f"Based on {len(messages)} messages | Cached for future reference")
+            
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            
+        except Exception as e:
+            logger.error(f"Error analyzing user: {e}", exc_info=True)
+            await interaction.followup.send(
+                f"❌ An error occurred while analyzing {user.display_name}. Please try again later.",
+                ephemeral=True
+            )
+
     # ── Helper: search messages across server ────────────────────────
 
     async def _search_user_messages_in_server(
@@ -608,6 +758,29 @@ class ChatCog(commands.Cog, name="Chat"):
             return f"\n\n[Recent activity context - searched {search_scope}]" + "".join(context_parts)
         return ""
 
+    # ── Helper: extract reply context ─────────────────────────────────
+
+    def _get_reply_context(self, message: discord.Message) -> str:
+        """
+        Extract context from the message being replied to.
+        Returns formatted context string if message is a reply.
+        """
+        if not message.reference or not message.reference.resolved:
+            return ""
+        
+        replied_msg = message.reference.resolved
+        if isinstance(replied_msg, discord.DeletedReferencedMessage):
+            return ""
+        
+        # Get the author and content of the replied message
+        author_name = replied_msg.author.display_name
+        content = replied_msg.content[:200]  # Limit to 200 chars
+        
+        if not content:
+            content = "[attachment or embed]"
+        
+        return f"\n\n[Replying to @{author_name}: \"{content}\"]"
+
     # ── Helper: resolve mentions to display names ─────────────────────
 
     def _resolve_message_mentions(self, message: discord.Message) -> str:
@@ -700,11 +873,23 @@ class ChatCog(commands.Cog, name="Chat"):
         conv = self.mention_conversations[user_id]
         conv["last_activity"] = time.time()
         
+        # Get bot identity for this user (personalized name/relationship)
+        bot_identity = await self.bot.db.get_bot_identity(
+            str(user_id), str(message.guild.id)
+        )
+        bot_name = bot_identity["bot_name"] if bot_identity else "Starzai"
+        relationship = bot_identity["relationship"] if bot_identity else "a friendly AI assistant"
+        
+        # Fetch reply context if this is a reply
+        reply_context = self._get_reply_context(message)
+        
         # Fetch recent messages from mentioned users for context
         mentioned_context = await self._get_mentioned_users_context(message, limit=5)
         
-        # Add user message to history (with context if available)
+        # Add user message to history (with all context if available)
         user_message_content = content
+        if reply_context:
+            user_message_content += reply_context
         if mentioned_context:
             user_message_content += mentioned_context
         
@@ -717,8 +902,11 @@ class ChatCog(commands.Cog, name="Chat"):
         # Get user's preferred model
         model = await self._resolve_model(user_id)
         
-        # Build messages for API with server context
+        # Build messages for API with server context and bot identity
         system_prompt = MENTION_SYSTEM_PROMPT.format(
+            bot_name=bot_name,
+            relationship=relationship,
+            owner_name=message.author.display_name,
             server_name=message.guild.name,
             channel_name=message.channel.name if hasattr(message.channel, 'name') else "DM",
             user_display_name=message.author.display_name,
