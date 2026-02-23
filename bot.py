@@ -19,6 +19,7 @@ from utils.db_manager import DatabaseManager
 from utils.embedder import Embedder
 from utils.llm_client import LLMClient
 from utils.rate_limiter import RateLimiter
+from utils.tasks import BackgroundTasks
 
 # ── Logging ──────────────────────────────────────────────────────────
 settings = Settings()
@@ -42,6 +43,7 @@ COGS = [
     "cogs.files",
     "cogs.games",
     "cogs.admin",
+    "cogs.privacy",
 ]
 
 
@@ -83,6 +85,7 @@ class StarzaiBot(commands.Bot):
             daily_token_limit_server=settings.daily_token_limit_server,
         )
         self.database = DatabaseManager()
+        self.background_tasks = None  # Will be initialized after setup
         self._health_runner: Optional[web.AppRunner] = None
 
     # ── Startup ──────────────────────────────────────────────────────
@@ -111,6 +114,9 @@ class StarzaiBot(commands.Bot):
 
         # Start health-check HTTP server for Railway
         await self._start_health_server()
+        
+        # Start background tasks
+        self.background_tasks = BackgroundTasks(self)
 
     async def on_ready(self) -> None:
         logger.info("✨ %s is online! Guilds: %d", self.user, len(self.guilds))
@@ -121,10 +127,45 @@ class StarzaiBot(commands.Bot):
             )
         )
 
+    async def on_message(self, message: discord.Message) -> None:
+        """Track user messages for personalization."""
+        # Ignore bot messages
+        if message.author.bot:
+            return
+
+        # Ignore DMs (no guild)
+        if not message.guild:
+            return
+
+        # Store message for context
+        try:
+            await self.database.store_user_message(
+                user_id=str(message.author.id),
+                guild_id=str(message.guild.id),
+                channel_id=str(message.channel.id),
+                content=message.content,
+            )
+
+            # Update user context every 5 messages
+            if message.author.id % 5 == 0:  # Simple modulo check
+                recent = await self.database.get_recent_messages(
+                    str(message.author.id), str(message.guild.id), limit=20
+                )
+                await self.database.update_user_context(
+                    str(message.author.id), str(message.guild.id), recent
+                )
+        except Exception as e:
+            logger.error(f"Error storing message: {e}", exc_info=True)
+
+        # Process commands (important for prefix commands if any)
+        await self.process_commands(message)
+
     # ── Shutdown ─────────────────────────────────────────────────────
 
     async def close(self) -> None:
         logger.info("Shutting down…")
+        if self.background_tasks:
+            self.background_tasks.stop()
         await self.llm.close()
         await self.database.close()
         if self._health_runner:

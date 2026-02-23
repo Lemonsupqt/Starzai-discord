@@ -91,12 +91,41 @@ class DatabaseManager:
                 created_at      TEXT    DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS user_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         TEXT    NOT NULL,
+                guild_id        TEXT    NOT NULL,
+                channel_id      TEXT    NOT NULL,
+                message_content TEXT    NOT NULL,
+                timestamp       TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS user_context (
+                user_id             TEXT    PRIMARY KEY,
+                guild_id            TEXT    NOT NULL,
+                recent_messages     TEXT    DEFAULT '[]',
+                personality_summary TEXT    DEFAULT NULL,
+                interests           TEXT    DEFAULT '[]',
+                last_updated        TEXT    DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS user_privacy (
+                user_id         TEXT    PRIMARY KEY,
+                data_collection INTEGER DEFAULT 1,
+                opted_out_at    TEXT    DEFAULT NULL,
+                created_at      TEXT    DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
                 ON usage_logs(user_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_guild
                 ON usage_logs(guild_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_user_messages
+                ON user_messages(user_id, guild_id, timestamp);
+            CREATE INDEX IF NOT EXISTS idx_user_context
+                ON user_context(user_id, guild_id);
             """
         )
         await self.db.commit()
@@ -309,3 +338,83 @@ class DatabaseManager:
         )
         await self.db.commit()
 
+    # ── User Messages & Personalization ──────────────────────────────
+
+    async def store_user_message(
+        self, user_id: str, guild_id: str, channel_id: str, content: str
+    ) -> None:
+        """Store a user message for personalization."""
+        # Check if user has opted out
+        async with self.db.execute(
+            "SELECT data_collection FROM user_privacy WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            if row and row["data_collection"] == 0:
+                return  # User has opted out
+
+        await self.db.execute(
+            "INSERT INTO user_messages (user_id, guild_id, channel_id, message_content) VALUES (?, ?, ?, ?)",
+            (user_id, guild_id, channel_id, content),
+        )
+        await self.db.commit()
+
+    async def get_recent_messages(
+        self, user_id: str, guild_id: str, limit: int = 20
+    ) -> List[str]:
+        """Get recent messages from a user."""
+        async with self.db.execute(
+            "SELECT message_content FROM user_messages WHERE user_id = ? AND guild_id = ? ORDER BY timestamp DESC LIMIT ?",
+            (user_id, guild_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [row["message_content"] for row in rows]
+
+    async def update_user_context(
+        self, user_id: str, guild_id: str, recent_messages: List[str]
+    ) -> None:
+        """Update user context with recent messages."""
+        await self.db.execute(
+            """INSERT INTO user_context (user_id, guild_id, recent_messages, last_updated)
+               VALUES (?, ?, ?, datetime('now'))
+               ON CONFLICT(user_id) DO UPDATE SET
+                   recent_messages = excluded.recent_messages,
+                   last_updated = excluded.last_updated""",
+            (user_id, guild_id, json.dumps(recent_messages)),
+        )
+        await self.db.commit()
+
+    async def get_user_context(
+        self, user_id: str, guild_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Get user context for personalization."""
+        async with self.db.execute(
+            "SELECT recent_messages, personality_summary, interests FROM user_context WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id),
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return {
+                    "recent_messages": json.loads(row["recent_messages"]),
+                    "personality_summary": row["personality_summary"],
+                    "interests": json.loads(row["interests"]) if row["interests"] else [],
+                }
+        return None
+
+    async def delete_user_data(self, user_id: str) -> None:
+        """Delete all data for a user (for /forget-me command)."""
+        await self.db.execute("DELETE FROM user_messages WHERE user_id = ?", (user_id,))
+        await self.db.execute("DELETE FROM user_context WHERE user_id = ?", (user_id,))
+        await self.db.execute(
+            "INSERT OR REPLACE INTO user_privacy (user_id, data_collection, opted_out_at) VALUES (?, 0, datetime('now'))",
+            (user_id,),
+        )
+        await self.db.commit()
+
+    async def cleanup_old_messages(self, days: int = 30) -> int:
+        """Delete messages older than specified days. Returns count of deleted messages."""
+        async with self.db.execute(
+            "DELETE FROM user_messages WHERE timestamp < datetime('now', ? || ' days')",
+            (f"-{days}",),
+        ) as cur:
+            await self.db.commit()
+            return cur.rowcount if cur.rowcount else 0
