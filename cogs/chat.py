@@ -45,7 +45,8 @@ MENTION_SYSTEM_PROMPT = (
     "Context: You are chatting in the Discord server \"{server_name}\" in the #{channel_name} channel. "
     "The user talking to you is \"{user_display_name}\". "
     "When the user mentions other people by name in their messages, those are real users in the server — "
-    "acknowledge them naturally."
+    "acknowledge them naturally. If recent message context is provided for mentioned users, use it to give "
+    "informed responses about their activity, personality, or recent topics they've discussed."
 )
 
 # Auto-expiry for @mention conversations (10 minutes of inactivity)
@@ -486,6 +487,54 @@ class ChatCog(commands.Cog, name="Chat"):
             ephemeral=True,
         )
 
+    # ── Helper: fetch recent messages from mentioned users ───────────
+
+    async def _get_mentioned_users_context(
+        self, message: discord.Message, limit: int = 5
+    ) -> str:
+        """
+        Fetch recent messages from users mentioned in the message.
+        Returns a formatted string with their recent activity.
+        """
+        if not message.mentions:
+            return ""
+        
+        # Filter out the bot from mentions
+        mentioned_users = [m for m in message.mentions if m.id != self.bot.user.id]
+        if not mentioned_users:
+            return ""
+        
+        context_parts = []
+        
+        for user in mentioned_users[:3]:  # Limit to 3 users to avoid spam
+            try:
+                # Fetch recent messages from this user in the channel
+                recent_messages = []
+                async for msg in message.channel.history(limit=100):
+                    if msg.author.id == user.id and not msg.author.bot:
+                        # Clean up the message content
+                        content = msg.content.strip()
+                        if content and len(content) < 500:  # Skip very long messages
+                            recent_messages.append(content)
+                        if len(recent_messages) >= limit:
+                            break
+                
+                if recent_messages:
+                    context_parts.append(
+                        f"\n@{user.display_name}'s recent messages in this channel:\n"
+                        + "\n".join(f"  - \"{msg}\"" for msg in recent_messages)
+                    )
+            except discord.Forbidden:
+                # No permission to read message history
+                continue
+            except Exception as e:
+                logger.warning(f"Error fetching messages for user {user.id}: {e}")
+                continue
+        
+        if context_parts:
+            return "\n\n[Recent activity context]" + "".join(context_parts)
+        return ""
+
     # ── Helper: resolve mentions to display names ─────────────────────
 
     def _resolve_message_mentions(self, message: discord.Message) -> str:
@@ -578,8 +627,15 @@ class ChatCog(commands.Cog, name="Chat"):
         conv = self.mention_conversations[user_id]
         conv["last_activity"] = time.time()
         
-        # Add user message to history
-        conv["messages"].append({"role": "user", "content": content})
+        # Fetch recent messages from mentioned users for context
+        mentioned_context = await self._get_mentioned_users_context(message, limit=5)
+        
+        # Add user message to history (with context if available)
+        user_message_content = content
+        if mentioned_context:
+            user_message_content += mentioned_context
+        
+        conv["messages"].append({"role": "user", "content": user_message_content})
         
         # Keep only last 10 messages (5 exchanges)
         if len(conv["messages"]) > MAX_CONVERSATION_MESSAGES:
