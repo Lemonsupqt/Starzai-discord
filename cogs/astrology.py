@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List
 
 import discord
 from discord import app_commands
@@ -18,6 +18,99 @@ from utils.llm_client import LLMClientError
 
 if TYPE_CHECKING:
     from bot import StarzaiBot
+
+
+class BirthChartPaginationView(discord.ui.View):
+    """Interactive pagination view for birth chart readings."""
+    
+    def __init__(
+        self,
+        pages: List[str],
+        date: str,
+        time: str,
+        location: str,
+        user_id: int,
+    ):
+        super().__init__(timeout=600)  # 10 minute timeout
+        self.pages = pages
+        self.date = date
+        self.time = time
+        self.location = location
+        self.user_id = user_id
+        self.current_page = 0
+        
+        # Update button states
+        self._update_buttons()
+    
+    def _update_buttons(self):
+        """Update button states based on current page."""
+        # Disable previous button on first page
+        self.previous_button.disabled = self.current_page == 0
+        # Disable next button on last page
+        self.next_button.disabled = self.current_page == len(self.pages) - 1
+    
+    def _create_embed(self) -> discord.Embed:
+        """Create embed for current page."""
+        page_content = self.pages[self.current_page]
+        
+        # Check if this is the typology section
+        is_typology = "MBTI" in page_content or "Enneagram" in page_content or "Big Five" in page_content
+        
+        if is_typology:
+            embed = discord.Embed(
+                title=f"🎁 Birth Chart Reading — Page {self.current_page + 1}/{len(self.pages)} (Personality Typology)",
+                description=page_content,
+                color=discord.Color.purple(),
+            )
+            embed.set_footer(text="Based on astrological chart • For entertainment and insight")
+        else:
+            if self.current_page == 0:
+                # First page includes birth info
+                embed = discord.Embed(
+                    title=f"🌟 Birth Chart Reading — Page {self.current_page + 1}/{len(self.pages)}",
+                    description=page_content,
+                    color=discord.Color.blue(),
+                )
+                embed.add_field(name="Date", value=self.date, inline=True)
+                embed.add_field(name="Time", value=self.time, inline=True)
+                embed.add_field(name="Location", value=self.location, inline=True)
+            else:
+                embed = discord.Embed(
+                    title=f"🌟 Birth Chart Reading — Page {self.current_page + 1}/{len(self.pages)}",
+                    description=page_content,
+                    color=discord.Color.blue(),
+                )
+        
+        embed.set_footer(text=f"Page {self.current_page + 1}/{len(self.pages)} • Use buttons to navigate • Download full report below")
+        return embed
+    
+    @discord.ui.button(label="◀️ Previous", style=discord.ButtonStyle.secondary, custom_id="previous")
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to previous page."""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "These buttons aren't for you! Use `/birth-chart` to get your own reading.",
+                ephemeral=True,
+            )
+            return
+        
+        self.current_page = max(0, self.current_page - 1)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._create_embed(), view=self)
+    
+    @discord.ui.button(label="Next ▶️", style=discord.ButtonStyle.primary, custom_id="next")
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to next page."""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "These buttons aren't for you! Use `/birth-chart` to get your own reading.",
+                ephemeral=True,
+            )
+            return
+        
+        self.current_page = min(len(self.pages) - 1, self.current_page + 1)
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._create_embed(), view=self)
 
 logger = logging.getLogger(__name__)
 
@@ -208,11 +301,12 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 max_tokens=8192,  # Maximum tokens for full comprehensive analysis
             )
             
-            # Smart chunking: Split the response into multiple embeds
+            # Smart chunking: Split the response into max 7 pages
             full_content = resp.content
             chunk_size = 3900  # Safe limit below Discord's 4096
+            max_pages = 7  # Maximum number of pages
             
-            # Split content intelligently by sections (look for **PART markers)
+            # Split content intelligently by sections
             chunks = []
             current_chunk = ""
             
@@ -231,38 +325,15 @@ class AstrologyCog(commands.Cog, name="Astrology"):
             if current_chunk:
                 chunks.append(current_chunk.strip())
             
-            # Send all chunks as separate embeds
-            for i, chunk in enumerate(chunks, 1):
-                if i == 1:
-                    # First embed includes birth info
-                    embed = Embedder.standard(
-                        f"🌟 Birth Chart Reading — Part {i}/{len(chunks)}",
-                        chunk,
-                        fields=[
-                            ("Date", date, True),
-                            ("Time", time, True),
-                            ("Location", location, True),
-                        ],
-                    )
-                else:
-                    # Subsequent embeds
-                    # Check if this is the typology section (contains MBTI or Enneagram)
-                    is_typology = "MBTI" in chunk or "Enneagram" in chunk or "Big Five" in chunk
-                    
-                    if is_typology:
-                        embed = discord.Embed(
-                            title=f"🎁 Birth Chart Reading — Part {i}/{len(chunks)} (Personality Typology)",
-                            description=chunk,
-                            color=discord.Color.purple(),
-                        )
-                        embed.set_footer(text="Based on astrological chart • For entertainment and insight")
-                    else:
-                        embed = Embedder.standard(
-                            f"🌟 Birth Chart Reading — Part {i}/{len(chunks)}",
-                            chunk,
-                        )
-                
-                await interaction.followup.send(embed=embed)
+            # Limit to max 7 pages (merge if needed)
+            if len(chunks) > max_pages:
+                # Merge chunks to fit within max_pages
+                merged_chunks = []
+                chunks_per_page = len(chunks) // max_pages + 1
+                for i in range(0, len(chunks), chunks_per_page):
+                    merged = '\n\n'.join(chunks[i:i+chunks_per_page])
+                    merged_chunks.append(merged[:3900])  # Safety limit
+                chunks = merged_chunks[:max_pages]
             
             # Create and send a downloadable .txt file with the complete report
             # Strip Markdown formatting for clean plain text
@@ -317,10 +388,21 @@ class AstrologyCog(commands.Cog, name="Astrology"):
                 temp_path = f.name
             
             try:
-                # Send the file
+                # Create pagination view
+                view = BirthChartPaginationView(
+                    pages=chunks,
+                    date=date,
+                    time=time,
+                    location=location,
+                    user_id=interaction.user.id,
+                )
+                
+                # Send the file with the first page embed and pagination buttons
                 file = discord.File(temp_path, filename=f"birth_chart_{date.replace('-', '')}_{interaction.user.name}.txt")
                 await interaction.followup.send(
-                    content="📄 **Complete Birth Chart Report** — Download your full reading as a text file!",
+                    content="📄 **Complete Birth Chart Report** — Use buttons to navigate pages, download full report below!",
+                    embed=view._create_embed(),
+                    view=view,
                     file=file
                 )
             finally:
