@@ -70,7 +70,7 @@ class AnalysisOptInView(discord.ui.View):
     
     def __init__(self, db_manager, user_id: str, guild_id: str):
         super().__init__(timeout=300)  # 5 minute timeout
-        self.db_manager = db_manager
+        self.bot.database = db_manager
         self.user_id = user_id
         self.guild_id = guild_id
     
@@ -84,7 +84,7 @@ class AnalysisOptInView(discord.ui.View):
             )
             return
         
-        await self.db_manager.set_analysis_opt_in(self.user_id, self.guild_id, True)
+        await self.bot.database.set_analysis_opt_in(self.user_id, self.guild_id, True)
         await interaction.response.edit_message(
             content="✅ **Analysis Enabled!**\n\n"
                     "You can now be analyzed with `/analyze` and `/compare` commands.\n"
@@ -102,7 +102,7 @@ class AnalysisOptInView(discord.ui.View):
             )
             return
         
-        await self.db_manager.set_analysis_opt_in(self.user_id, self.guild_id, False)
+        await self.bot.database.set_analysis_opt_in(self.user_id, self.guild_id, False)
         await interaction.response.edit_message(
             content="❌ **Analysis Disabled**\n\n"
                     "You won't be analyzed by `/analyze` or `/compare` commands.\n"
@@ -618,7 +618,7 @@ class ChatCog(commands.Cog, name="Chat"):
         # Check if analyzing self (always allowed) or if target user has opted in
         is_self_analysis = target_user_id == analyzer_id
         if not is_self_analysis:
-            has_opted_in = await self.db_manager.get_analysis_opt_in(target_user_id, guild_id)
+            has_opted_in = await self.bot.database.get_analysis_opt_in(target_user_id, guild_id)
             if not has_opted_in:
                 await interaction.followup.send(
                     f"❌ {user.mention} hasn't enabled analysis yet. "
@@ -972,7 +972,7 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
     async def allow_analysis(self, interaction: discord.Interaction) -> None:
         """Allow or disable personality analysis features."""
         # Check current opt-in status
-        current_status = await self.db_manager.get_analysis_opt_in(
+        current_status = await self.bot.database.get_analysis_opt_in(
             str(interaction.user.id),
             str(interaction.guild.id)
         )
@@ -1002,7 +1002,7 @@ Want to discover fun insights about your communication style? I can analyze your
 Curious what I'll discover? 🎨"""
         
         view = AnalysisOptInView(
-            self.db_manager,
+            self.bot.database,
             str(interaction.user.id),
             str(interaction.guild.id)
         )
@@ -1050,7 +1050,7 @@ Curious what I'll discover? 🎨"""
         
         # Check user1 opt-in (unless it's the analyzer themselves)
         if str(user1.id) != analyzer_id:
-            has_opted_in = await self.db_manager.get_analysis_opt_in(str(user1.id), guild_id)
+            has_opted_in = await self.bot.database.get_analysis_opt_in(str(user1.id), guild_id)
             if not has_opted_in:
                 await interaction.followup.send(
                     f"❌ {user1.mention} hasn't enabled analysis yet. "
@@ -1061,7 +1061,7 @@ Curious what I'll discover? 🎨"""
         
         # Check user2 opt-in (unless it's the analyzer themselves)
         if str(user2.id) != analyzer_id:
-            has_opted_in = await self.db_manager.get_analysis_opt_in(str(user2.id), guild_id)
+            has_opted_in = await self.bot.database.get_analysis_opt_in(str(user2.id), guild_id)
             if not has_opted_in:
                 await interaction.followup.send(
                     f"❌ {user2.mention} hasn't enabled analysis yet. "
