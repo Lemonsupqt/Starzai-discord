@@ -522,7 +522,7 @@ class ChatCog(commands.Cog, name="Chat"):
             return
         
         # Store the bot identity
-        await self.bot.db.set_bot_identity(user_id, guild_id, bot_name, relationship)
+        await self.bot.database.set_bot_identity(user_id, guild_id, bot_name, relationship)
         
         await interaction.response.send_message(
             f"✅ **Bot identity set!**\n\n"
@@ -559,7 +559,7 @@ class ChatCog(commands.Cog, name="Chat"):
         
         try:
             # Try to fetch from database first
-            db_messages = await self.bot.db.search_user_messages(
+            db_messages = await self.bot.database.search_user_messages(
                 target_user_id, guild_id, limit=200
             )
             
@@ -640,7 +640,7 @@ Keep it insightful but respectful. Focus on observable patterns, not judgments."
             
             # Store the analysis
             date_range = f"Last {len(messages)} messages"
-            await self.bot.db.store_user_analysis(
+            await self.bot.database.store_user_analysis(
                 target_user_id,
                 guild_id,
                 analyzer_id,
@@ -862,7 +862,7 @@ Keep it insightful but respectful. Focus on observable patterns, not judgments."
         # Log non-bot messages to database for future analysis (async, don't await)
         if not message.author.bot and message.content.strip():
             try:
-                await self.bot.db.store_user_message(
+                await self.bot.database.store_user_message(
                     str(message.author.id),
                     str(message.guild.id),
                     str(message.channel.id),
@@ -919,7 +919,7 @@ Keep it insightful but respectful. Focus on observable patterns, not judgments."
         conv["last_activity"] = time.time()
         
         # Get bot identity for this user (personalized name/relationship)
-        bot_identity = await self.bot.db.get_bot_identity(
+        bot_identity = await self.bot.database.get_bot_identity(
             str(user_id), str(message.guild.id)
         )
         bot_name = bot_identity["bot_name"] if bot_identity else "Starzai"
