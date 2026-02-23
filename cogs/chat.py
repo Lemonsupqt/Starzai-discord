@@ -487,14 +487,53 @@ class ChatCog(commands.Cog, name="Chat"):
             ephemeral=True,
         )
 
+    # ── Helper: search messages across server ────────────────────────
+
+    async def _search_user_messages_in_server(
+        self, guild: discord.Guild, user_id: int, limit: int = 5
+    ) -> list[str]:
+        """
+        Search for recent messages from a user across all accessible channels in the server.
+        Simulates Discord's "from:user" search across the entire server.
+        """
+        found_messages = []
+        
+        # Iterate through text channels the bot can read
+        for channel in guild.text_channels:
+            if len(found_messages) >= limit:
+                break
+                
+            try:
+                # Check if bot has permission to read this channel
+                permissions = channel.permissions_for(guild.me)
+                if not permissions.read_message_history:
+                    continue
+                
+                # Search this channel for user's messages
+                async for msg in channel.history(limit=50):
+                    if msg.author.id == user_id and not msg.author.bot:
+                        content = msg.content.strip()
+                        if content and len(content) < 500:
+                            found_messages.append(f"[#{channel.name}] {content}")
+                            if len(found_messages) >= limit:
+                                break
+            except (discord.Forbidden, discord.HTTPException):
+                continue
+        
+        return found_messages
+
     # ── Helper: fetch recent messages from mentioned users ───────────
 
     async def _get_mentioned_users_context(
-        self, message: discord.Message, limit: int = 5
+        self, message: discord.Message, limit: int = 5, search_server: bool = False
     ) -> str:
         """
-        Fetch recent messages from users mentioned in the message.
+        Fetch recent messages from users mentioned in the message using optimized filtering.
         Returns a formatted string with their recent activity.
+        
+        This simulates Discord's search functionality:
+        - search_server=False: "from:user in:channel" (current channel only)
+        - search_server=True: "from:user" (across all accessible channels)
         """
         if not message.mentions:
             return ""
@@ -506,33 +545,67 @@ class ChatCog(commands.Cog, name="Chat"):
         
         context_parts = []
         
-        for user in mentioned_users[:3]:  # Limit to 3 users to avoid spam
-            try:
-                # Fetch recent messages from this user in the channel
-                recent_messages = []
-                async for msg in message.channel.history(limit=100):
-                    if msg.author.id == user.id and not msg.author.bot:
-                        # Clean up the message content
-                        content = msg.content.strip()
-                        if content and len(content) < 500:  # Skip very long messages
-                            recent_messages.append(content)
-                        if len(recent_messages) >= limit:
+        # Detect if user is asking for server-wide search based on message content
+        content_lower = message.content.lower()
+        search_keywords = ["server", "everywhere", "all channels", "anywhere", "overall", "generally"]
+        if not search_server and any(keyword in content_lower for keyword in search_keywords):
+            search_server = True
+        
+        try:
+            if search_server:
+                # Server-wide search: "from:user" across all channels
+                for user in mentioned_users[:3]:
+                    messages_list = await self._search_user_messages_in_server(
+                        message.guild, user.id, limit
+                    )
+                    if messages_list:
+                        context_parts.append(
+                            f"\n@{user.display_name}'s recent messages across the server:\n"
+                            + "\n".join(f"  - {msg}" for msg in messages_list)
+                        )
+            else:
+                # Channel-only search: "from:user in:channel"
+                user_ids = {user.id for user in mentioned_users[:3]}
+                
+                # Optimized: Fetch messages in bulk and filter in memory
+                history_messages = []
+                async for msg in message.channel.history(limit=200, before=message):
+                    # Filter: only messages from mentioned users, not bots, with content
+                    if (msg.author.id in user_ids and 
+                        not msg.author.bot and 
+                        msg.content.strip() and 
+                        len(msg.content) < 500):
+                        history_messages.append(msg)
+                        # Early exit if we have enough messages for all users
+                        if len(history_messages) >= limit * len(user_ids):
                             break
                 
-                if recent_messages:
-                    context_parts.append(
-                        f"\n@{user.display_name}'s recent messages in this channel:\n"
-                        + "\n".join(f"  - \"{msg}\"" for msg in recent_messages)
-                    )
-            except discord.Forbidden:
-                # No permission to read message history
-                continue
-            except Exception as e:
-                logger.warning(f"Error fetching messages for user {user.id}: {e}")
-                continue
+                # Group messages by user (simulates "from:user" filtering)
+                user_messages = {user_id: [] for user_id in user_ids}
+                for msg in history_messages:
+                    if len(user_messages[msg.author.id]) < limit:
+                        user_messages[msg.author.id].append(msg.content.strip())
+                
+                # Build context for each user
+                for user in mentioned_users[:3]:
+                    if user.id in user_messages and user_messages[user.id]:
+                        messages_list = user_messages[user.id]
+                        context_parts.append(
+                            f"\n@{user.display_name}'s recent messages in #{message.channel.name}:\n"
+                            + "\n".join(f"  - \"{msg}\"" for msg in messages_list)
+                        )
+                    
+        except discord.Forbidden:
+            # No permission to read message history
+            logger.warning(f"No permission to read history in channel {message.channel.id}")
+            return ""
+        except Exception as e:
+            logger.error(f"Error fetching message context: {e}", exc_info=True)
+            return ""
         
+        search_scope = "server-wide" if search_server else f"#{message.channel.name}"
         if context_parts:
-            return "\n\n[Recent activity context]" + "".join(context_parts)
+            return f"\n\n[Recent activity context - searched {search_scope}]" + "".join(context_parts)
         return ""
 
     # ── Helper: resolve mentions to display names ─────────────────────
