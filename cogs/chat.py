@@ -979,25 +979,27 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
         
         status_text = "✅ **Currently Enabled**" if current_status else "❌ **Currently Disabled**"
         
-        disclaimer = f"""🔍 **User Analysis Feature**
+        disclaimer = f"""✨ **Personality Insights**
 
 {status_text}
 
-This bot can create personality insights based on your Discord messages!
+Want to discover fun insights about your communication style? I can analyze your messages to create a personality profile just for you!
 
-**What we analyze:**
-• Communication style & tone
-• Personality traits & interests  
-• Activity patterns
-• Word frequency & vocabulary
+**What I look at:**
+• How you express yourself
+• Your interests and conversation topics
+• When you're most active
+• Your unique vocabulary and phrases
 
-**Your privacy:**
-• Only opted-in users can be analyzed
-• You can toggle this on/off anytime
-• Your data stays in this server
-• Analysis is respectful & insightful
+**Your control:**
+• Completely optional - you choose!
+• Toggle on/off whenever you want
+• Your messages stay private in this server
+• Fun, respectful insights only
 
-Ready to see what makes you unique? 🌟"""
+**Privacy Note:** This feature uses message content for personality analysis (an approved Discord use case). Only you and those you chat with can be analyzed, and only if you opt in. No data leaves this server.
+
+Curious what I'll discover? 🎨"""
         
         view = AnalysisOptInView(
             self.db_manager,
