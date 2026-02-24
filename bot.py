@@ -87,6 +87,7 @@ class StarzaiBot(commands.Bot):
         self.database = DatabaseManager()
         self.background_tasks = None  # Will be initialized after setup
         self._health_runner: Optional[web.AppRunner] = None
+        self._message_counts: dict[tuple[int, int], int] = {}
 
     # ── Startup ──────────────────────────────────────────────────────
 
@@ -147,7 +148,9 @@ class StarzaiBot(commands.Bot):
             )
 
             # Update user context every 5 messages
-            if message.author.id % 5 == 0:  # Simple modulo check
+            key = (message.author.id, message.guild.id)
+            self._message_counts[key] = self._message_counts.get(key, 0) + 1
+            if self._message_counts[key] % 5 == 0:
                 recent = await self.database.get_recent_messages(
                     str(message.author.id), str(message.guild.id), limit=20
                 )
