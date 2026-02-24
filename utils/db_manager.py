@@ -116,6 +116,38 @@ class DatabaseManager:
                 created_at      TEXT    DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS bot_identities (
+                user_id         TEXT    NOT NULL,
+                guild_id        TEXT    NOT NULL,
+                bot_name        TEXT    NOT NULL,
+                relationship    TEXT    DEFAULT 'assistant',
+                created_at      TEXT    DEFAULT (datetime('now')),
+                updated_at      TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS user_analyses (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                target_user_id  TEXT    NOT NULL,
+                guild_id        TEXT    NOT NULL,
+                analyzer_user_id TEXT   NOT NULL,
+                analysis_data   TEXT    NOT NULL,
+                message_count   INTEGER DEFAULT 0,
+                date_range      TEXT    DEFAULT NULL,
+                created_at      TEXT    DEFAULT (datetime('now')),
+                UNIQUE(target_user_id, guild_id, analyzer_user_id)
+            );
+
+
+            CREATE TABLE IF NOT EXISTS analysis_opt_in (
+                user_id         TEXT    NOT NULL,
+                guild_id        TEXT    NOT NULL,
+                opted_in        INTEGER DEFAULT 0,
+                created_at      TEXT    DEFAULT (datetime('now')),
+                updated_at      TEXT    DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, guild_id)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_conversations_user
                 ON conversations(user_id, active);
             CREATE INDEX IF NOT EXISTS idx_usage_logs_user
@@ -376,7 +408,7 @@ class DatabaseManager:
         await self.db.execute(
             """INSERT INTO user_context (user_id, guild_id, recent_messages, last_updated)
                VALUES (?, ?, ?, datetime('now'))
-               ON CONFLICT(user_id) DO UPDATE SET
+               ON CONFLICT(user_id, guild_id) DO UPDATE SET
                    recent_messages = excluded.recent_messages,
                    last_updated = excluded.last_updated""",
             (user_id, guild_id, json.dumps(recent_messages)),
@@ -418,3 +450,163 @@ class DatabaseManager:
         ) as cur:
             await self.db.commit()
             return cur.rowcount if cur.rowcount else 0
+
+    # ── Bot Identity & Personalization ───────────────────────────────
+
+    async def set_bot_identity(
+        self, user_id: str, guild_id: str, bot_name: str, relationship: str = "assistant"
+    ) -> None:
+        """Set personalized bot identity for a user."""
+        await self.db.execute(
+            """INSERT INTO bot_identities (user_id, guild_id, bot_name, relationship, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now'))
+               ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                   bot_name = excluded.bot_name,
+                   relationship = excluded.relationship,
+                   updated_at = excluded.updated_at""",
+            (user_id, guild_id, bot_name, relationship),
+        )
+        await self.db.commit()
+
+    async def get_bot_identity(
+        self, user_id: str, guild_id: str
+    ) -> Optional[Dict[str, str]]:
+        """Get personalized bot identity for a user."""
+        async with self.db.execute(
+            "SELECT bot_name, relationship FROM bot_identities WHERE user_id = ? AND guild_id = ?",
+            (user_id, guild_id),
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return {"bot_name": row["bot_name"], "relationship": row["relationship"]}
+        return None
+
+    # ── Deep Message Search ──────────────────────────────────────────
+
+    async def search_user_messages(
+        self,
+        user_id: str,
+        guild_id: str,
+        limit: int = 100,
+        days_back: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Deep search for user messages with optional time range.
+        Returns messages with timestamps for analysis.
+        """
+        query = """
+            SELECT message_content, channel_id, timestamp
+            FROM user_messages
+            WHERE user_id = ? AND guild_id = ?
+        """
+        params: list = [user_id, guild_id]
+
+        if days_back:
+            query += " AND timestamp >= datetime('now', ? || ' days')"
+            params.append(f"-{days_back}")
+
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+
+        async with self.db.execute(query, params) as cur:
+            rows = await cur.fetchall()
+            return [
+                {
+                    "content": row["message_content"],
+                    "channel_id": row["channel_id"],
+                    "timestamp": row["timestamp"],
+                }
+                for row in rows
+            ]
+
+    async def get_message_count(
+        self, user_id: str, guild_id: str, days_back: Optional[int] = None
+    ) -> int:
+        """Get total message count for a user."""
+        query = "SELECT COUNT(*) as cnt FROM user_messages WHERE user_id = ? AND guild_id = ?"
+        params: list = [user_id, guild_id]
+
+        if days_back:
+            query += " AND timestamp >= datetime('now', ? || ' days')"
+            params.append(f"-{days_back}")
+
+        async with self.db.execute(query, params) as cur:
+            row = await cur.fetchone()
+            return row["cnt"] if row else 0
+
+    # ── User Analysis Storage ────────────────────────────────────────
+
+    async def store_user_analysis(
+        self,
+        target_user_id: str,
+        guild_id: str,
+        analyzer_user_id: str,
+        analysis_data: Dict[str, Any],
+        message_count: int,
+        date_range: str,
+    ) -> None:
+        """Store comprehensive user analysis."""
+        await self.db.execute(
+            """INSERT INTO user_analyses 
+               (target_user_id, guild_id, analyzer_user_id, analysis_data, message_count, date_range)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(target_user_id, guild_id, analyzer_user_id) DO UPDATE SET
+                   analysis_data = excluded.analysis_data,
+                   message_count = excluded.message_count,
+                   date_range = excluded.date_range,
+                   created_at = datetime('now')""",
+            (
+                target_user_id,
+                guild_id,
+                analyzer_user_id,
+                json.dumps(analysis_data),
+                message_count,
+                date_range,
+            ),
+        )
+        await self.db.commit()
+
+    async def get_user_analysis(
+        self, target_user_id: str, guild_id: str, analyzer_user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve stored user analysis."""
+        async with self.db.execute(
+            """SELECT analysis_data, message_count, date_range, created_at
+               FROM user_analyses
+               WHERE target_user_id = ? AND guild_id = ? AND analyzer_user_id = ?""",
+            (target_user_id, guild_id, analyzer_user_id),
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return {
+                    "analysis": json.loads(row["analysis_data"]),
+                    "message_count": row["message_count"],
+                    "date_range": row["date_range"],
+                    "created_at": row["created_at"],
+                }
+        return None
+
+    async def set_analysis_opt_in(self, user_id: str, guild_id: str, opted_in: bool) -> None:
+        """Set user's analysis opt-in preference."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO analysis_opt_in (user_id, guild_id, opted_in, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                    opted_in = excluded.opted_in,
+                    updated_at = datetime('now')
+                """,
+                (user_id, guild_id, 1 if opted_in else 0)
+            )
+            await db.commit()
+    
+    async def get_analysis_opt_in(self, user_id: str, guild_id: str) -> bool:
+        """Check if user has opted in to analysis features."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT opted_in FROM analysis_opt_in WHERE user_id = ? AND guild_id = ?",
+                (user_id, guild_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return bool(row[0]) if row else False
