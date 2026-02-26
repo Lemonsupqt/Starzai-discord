@@ -201,6 +201,7 @@ class LLMClient:
 
         last_error: Optional[Exception] = None
         timeout = aiohttp.ClientTimeout(total=API_TIMEOUT * 2)
+        content_yielded = False
 
         for attempt in range(API_MAX_RETRIES):
             try:
@@ -229,6 +230,13 @@ class LLMClient:
                                 wait = API_RETRY_BASE_DELAY * (2**attempt)
 
                             if attempt < API_MAX_RETRIES - 1:
+                                logger.warning(
+                                    "Stream %s (attempt %d/%d), waiting %.1fs",
+                                    "rate limited" if resp.status == 429 else f"error {resp.status}",
+                                    attempt + 1,
+                                    API_MAX_RETRIES,
+                                    wait,
+                                )
                                 await asyncio.sleep(wait)
                                 continue
 
@@ -263,6 +271,7 @@ class LLMClient:
                                 delta = data["choices"][0].get("delta", {})
                                 content = delta.get("content")
                                 if content:
+                                    content_yielded = True
                                     yield content
                             except (json.JSONDecodeError, KeyError, IndexError, TypeError):
                                 continue
@@ -270,14 +279,27 @@ class LLMClient:
                     return
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # Never retry after content has been partially yielded — it
+                # would duplicate chunks already sent to the caller.
+                if content_yielded:
+                    raise LLMClientError(
+                        f"Stream interrupted after partial content: {exc}"
+                    ) from exc
+
                 last_error = exc
                 wait = API_RETRY_BASE_DELAY * (2**attempt)
+                logger.warning(
+                    "Stream network error (attempt %d/%d): %s",
+                    attempt + 1,
+                    API_MAX_RETRIES,
+                    exc,
+                )
                 if attempt < API_MAX_RETRIES - 1:
                     await asyncio.sleep(wait)
                     continue
-                raise LLMClientError(f"All {API_MAX_RETRIES} stream retries failed: {exc}") from exc
-
-        raise LLMClientError(f"All {API_MAX_RETRIES} stream retries failed: {last_error}")
+                raise LLMClientError(
+                    f"All {API_MAX_RETRIES} stream retries failed: {exc}"
+                ) from exc
 
     # ── Convenience Methods ──────────────────────────────────────────
 

@@ -34,10 +34,9 @@ def _parse_optional_int(raw: str) -> Optional[int]:
     if not raw:
         return None
     try:
-        value = int(raw)
+        return int(raw)
     except ValueError:
         return None
-    return value or None
 
 
 @dataclass(frozen=True)

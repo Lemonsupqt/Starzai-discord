@@ -83,7 +83,12 @@ class DatabaseManager:
             INSERT INTO user_context
                 (user_id, guild_id, recent_messages, personality_summary, interests, last_updated)
             SELECT
-                user_id, guild_id, recent_messages, personality_summary, interests, last_updated
+                user_id,
+                COALESCE(guild_id, '0') AS guild_id,
+                recent_messages,
+                personality_summary,
+                interests,
+                last_updated
             FROM user_context_old;
 
             DROP TABLE user_context_old;

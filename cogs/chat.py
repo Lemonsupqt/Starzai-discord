@@ -1449,9 +1449,7 @@ Format with bullet points and emojis. Be insightful and respectful."""
         # Ignore DMs
         if not message.guild:
             return
-        
-        
-        
+
         # Ignore bots for conversation handling
         if message.author.bot:
             return
