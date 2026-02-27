@@ -208,8 +208,12 @@ class MusicAPI:
         """
         Search for songs across all API endpoints with automatic fallback.
 
-        Returns a normalised list of song dicts, or None if every endpoint fails.
+        Returns a normalised list of song dicts, an empty list ``[]`` if an
+        endpoint responded successfully but had no matches, or ``None`` if
+        every endpoint failed (network errors / non-200 responses).
         """
+        any_endpoint_succeeded = False
+
         for api_base in MUSIC_APIS:
             try:
                 url = f"{api_base}/search/songs"
@@ -240,7 +244,9 @@ class MusicAPI:
                         if results is None:
                             results = data.get("results")
 
-                    if results and isinstance(results, list):
+                    # Endpoint responded OK — mark as succeeded even if empty
+                    if isinstance(results, list):
+                        any_endpoint_succeeded = True
                         normalised = normalize_songs(results)
                         if normalised:
                             logger.info(
@@ -253,6 +259,11 @@ class MusicAPI:
                 logger.warning("Music API %s timed out for query '%s'", api_base, query)
             except Exception as exc:
                 logger.warning("Music API %s error for query '%s': %s", api_base, query, exc)
+
+        if any_endpoint_succeeded:
+            # At least one endpoint responded but had no results
+            logger.info("Music search '%s' returned no results", query)
+            return []
 
         logger.error("All music APIs failed for query: %s", query)
         return None

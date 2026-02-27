@@ -69,7 +69,7 @@ async def resolve_url(url: str, session: aiohttp.ClientSession) -> Optional[str]
     # ── Deezer ────────────────────────────────────────────────────
     match = DEEZER_PATTERN.search(url)
     if match:
-        return await _resolve_deezer(url, match.group(1), session)
+        return await _resolve_deezer(match.group(1), session)
 
     # ── Apple Music (album link with ?i= track param) ─────────────
     match = APPLE_MUSIC_PATTERN.search(url)
@@ -112,7 +112,7 @@ async def _resolve_spotify(url: str, session: aiohttp.ClientSession) -> Optional
 
 
 async def _resolve_deezer(
-    url: str, track_id: str, session: aiohttp.ClientSession
+    track_id: str, session: aiohttp.ClientSession
 ) -> Optional[str]:
     """Resolve a Deezer track URL via their public API."""
     try:

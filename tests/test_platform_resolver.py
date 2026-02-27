@@ -231,9 +231,7 @@ class TestResolveDeezerAsync(unittest.IsolatedAsyncioTestCase):
         data = {"title": "Cool Song", "artist": {"name": "Cool Artist"}}
         resp = _FakeResponse(200, data)
         session = _FakeSession(resp)
-        result = await _resolve_deezer(
-            "https://deezer.com/en/track/123", "123", session
-        )
+        result = await _resolve_deezer("123", session)
         self.assertEqual(result, "Cool Song Cool Artist")
 
     async def test_returns_title_only_when_no_artist(self):
@@ -242,9 +240,7 @@ class TestResolveDeezerAsync(unittest.IsolatedAsyncioTestCase):
         data = {"title": "Solo", "artist": {}}
         resp = _FakeResponse(200, data)
         session = _FakeSession(resp)
-        result = await _resolve_deezer(
-            "https://deezer.com/en/track/123", "123", session
-        )
+        result = await _resolve_deezer("123", session)
         self.assertEqual(result, "Solo")
 
     async def test_returns_none_on_failure(self):
@@ -252,9 +248,7 @@ class TestResolveDeezerAsync(unittest.IsolatedAsyncioTestCase):
 
         resp = _FakeResponse(404)
         session = _FakeSession(resp)
-        result = await _resolve_deezer(
-            "https://deezer.com/en/track/123", "123", session
-        )
+        result = await _resolve_deezer("123", session)
         self.assertIsNone(result)
 
 

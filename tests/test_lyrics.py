@@ -2,10 +2,7 @@
 Tests for the lyrics fetcher.
 """
 
-import asyncio
-import json
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 from utils.lyrics import LyricsFetcher
 

@@ -32,7 +32,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config.constants import BOT_COLOR, BOT_ERROR_COLOR, BOT_INFO_COLOR, BOT_WARN_COLOR
+from config.constants import BOT_COLOR
 from utils.embedder import Embedder
 from utils.music_api import (
     DOWNLOAD_QUALITIES,
@@ -50,8 +50,6 @@ logger = logging.getLogger(__name__)
 
 # ── Colours (consistent with bot theme via constants) ─────────────────
 MUSIC_COLOR = BOT_COLOR
-ERROR_COLOR = BOT_ERROR_COLOR
-INFO_COLOR = BOT_INFO_COLOR
 
 # ── Discord limits ───────────────────────────────────────────────────
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
@@ -180,6 +178,10 @@ class SongSelectView(discord.ui.View):
             )
             return
 
+        # Rate-limit UI callbacks to prevent abuse
+        if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
+            return
+
         idx = int(interaction.data["values"][0])  # type: ignore[index]
         song = self.songs[idx]
 
@@ -255,6 +257,9 @@ class QualitySelectView(discord.ui.View):
                     "\u274c These buttons aren\u2019t for you!", ephemeral=True
                 )
                 return
+            # Rate-limit download button clicks to prevent abuse
+            if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
+                return
             await self.cog._download_song(interaction, self.song, quality)
 
         return callback
@@ -264,6 +269,9 @@ class QualitySelectView(discord.ui.View):
             await interaction.response.send_message(
                 "\u274c These buttons aren\u2019t for you!", ephemeral=True
             )
+            return
+        # Rate-limit play button clicks to prevent abuse
+        if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
             return
         await self.cog._play_song_in_vc(interaction, self.song)
 
@@ -857,6 +865,7 @@ class MusicCog(commands.Cog, name="Music"):
                 await interaction.followup.send(embed=embed)
             except Exception:
                 pass
+            await self._log_usage(interaction, "lyrics", latency_ms=latency_ms)
             return
 
         lyrics_text = result["lyrics"]
@@ -903,6 +912,21 @@ class MusicCog(commands.Cog, name="Music"):
         except Exception:
             pass
 
+        # Guard against session being closed (e.g. cog unloaded while UI active)
+        if not self._services_ready():
+            try:
+                await interaction.followup.send(
+                    embed=Embedder.error(
+                        "Service Unavailable",
+                        "\u274c Music services are not available right now. Please try again later.",
+                    ),
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+        start = time.monotonic()
         download_url = _get_url_for_quality(song.get("download_urls", []), quality)
         if not download_url:
             await interaction.followup.send(
@@ -975,20 +999,26 @@ class MusicCog(commands.Cog, name="Music"):
                     embed = _download_embed(song, quality, size_mb)
 
                     await interaction.followup.send(embed=embed, file=file)
+                    latency_ms = (time.monotonic() - start) * 1000
+                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms)
                 finally:
                     buffer.close()
 
         except asyncio.TimeoutError:
+            latency_ms = (time.monotonic() - start) * 1000
             await interaction.followup.send(
                 embed=Embedder.error("Timeout", "\u274c Download timed out. Please try again."),
                 ephemeral=True,
             )
+            await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="Timeout")
         except Exception as exc:
+            latency_ms = (time.monotonic() - start) * 1000
             logger.error("Download error: %s", exc, exc_info=True)
             await interaction.followup.send(
                 embed=Embedder.error("Download Failed", "\u274c An error occurred during download."),
                 ephemeral=True,
             )
+            await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=str(exc))
 
     # ── Internal: play song in VC ─────────────────────────────────────
 
@@ -1000,6 +1030,26 @@ class MusicCog(commands.Cog, name="Music"):
         followup: bool = False,
     ) -> None:
         """Join VC (if needed) and play/queue the song."""
+        # Guard against session being closed (e.g. cog unloaded while UI active)
+        if not self._services_ready():
+            msg = "\u274c Music services are not available right now. Please try again later."
+            try:
+                if followup:
+                    await interaction.followup.send(
+                        embed=Embedder.error("Service Unavailable", msg), ephemeral=True
+                    )
+                elif not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        embed=Embedder.error("Service Unavailable", msg), ephemeral=True
+                    )
+                else:
+                    await interaction.followup.send(
+                        embed=Embedder.error("Service Unavailable", msg), ephemeral=True
+                    )
+            except Exception:
+                pass
+            return
+
         if not interaction.guild:
             msg = "\u274c This command can only be used in a server."
             if followup:
@@ -1054,8 +1104,9 @@ class MusicCog(commands.Cog, name="Music"):
                     pass
             return
 
-        # Store requester
-        state.requester_map[song["id"]] = interaction.user.id
+        # Store requester (only when the song has a valid ID)
+        if song.get("id"):
+            state.requester_map[song["id"]] = interaction.user.id
         state.text_channel = interaction.channel
 
         # Connect to VC if not already
@@ -1154,7 +1205,9 @@ class MusicCog(commands.Cog, name="Music"):
 
         state = self._get_state(guild_id)
 
-        if state.queue:
+        # Iterate through the queue until we find a playable track or the queue is empty.
+        # This avoids recursion which could hit Python's recursion limit with long queues.
+        while state.queue:
             next_song = state.queue.pop(0)
             state.current = next_song
             stream_url = _pick_best_url(next_song.get("download_urls", []), "320kbps")
@@ -1162,21 +1215,23 @@ class MusicCog(commands.Cog, name="Music"):
                 await self._start_playback(guild_id, stream_url)
                 if state.text_channel:
                     try:
-                        requester_id = state.requester_map.get(next_song["id"])
+                        requester_id = state.requester_map.get(next_song.get("id", ""))
                         requester = self.bot.get_user(requester_id) if requester_id else None
                         embed = _now_playing_embed(next_song, requester)
                         view = NowPlayingView(next_song, self, guild_id)
                         await state.text_channel.send(embed=embed, view=view)
                     except Exception:
                         pass
+                return  # Successfully started playback
             else:
+                logger.warning("Skipping song '%s' — no stream URL", next_song.get("name", ""))
                 state.current = None
-                await self._play_next(guild_id)  # Try next song
-        else:
-            state.current = None
-            # Only schedule idle disconnect if still connected to VC
-            if state.voice_client and state.voice_client.is_connected():
-                state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
+
+        # Queue is empty
+        state.current = None
+        # Only schedule idle disconnect if still connected to VC
+        if state.voice_client and state.voice_client.is_connected():
+            state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
 
     # ── Internal: idle disconnect ─────────────────────────────────────
 
