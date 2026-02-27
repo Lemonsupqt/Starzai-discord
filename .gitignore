@@ -23,10 +23,11 @@ env/
 *.swp
 *.swo
 
-# Database
+# Database & runtime data
 *.db
 *.sqlite
 *.sqlite3
+data/
 
 # OS
 .DS_Store

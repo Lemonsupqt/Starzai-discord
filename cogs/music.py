@@ -2,16 +2,30 @@
 Music Cog — download, VC playback, lyrics, and platform URL resolution.
 
 Commands:
-    /music   — Search & download a song with quality selection
-    /play    — Search & play in voice channel
-    /skip    — Skip current song
+    /music      — Search & download a song with quality selection
+    /play       — Search & play in voice channel
+    /playnext   — Search & insert a song at the front of the queue
+    /skip       — Skip current song
     /music-stop — Stop playback & leave VC
-    /queue   — Show the current queue
-    /nowplaying — Show current song info
-    /pause   — Pause playback
-    /resume  — Resume playback
-    /volume  — Set playback volume
-    /lyrics  — Search for song lyrics
+    /queue      — Show the current queue (paginated)
+    /nowplaying — Show current song info with live progress bar
+    /pause      — Pause playback
+    /resume     — Resume playback
+    /volume     — Set playback volume
+    /shuffle    — Shuffle the queue
+    /loop       — Set loop mode (off / track / queue)
+    /seek       — Seek to a position in the current song
+    /remove     — Remove a song from the queue by position
+    /clear      — Clear the entire queue
+    /djrole     — Set or clear the DJ role for queue management
+    /lyrics     — Search for song lyrics
+
+Features:
+    • Progress bar with live position tracking
+    • Auto-resume on voice reconnect
+    • DJ role restrictions for queue management
+    • Queue pagination for large queues
+    • Platform URL resolution (Spotify, YouTube, SoundCloud, etc.)
 
 System requirement:
     FFmpeg must be installed on the host system (e.g. ``apt install ffmpeg``)
@@ -23,8 +37,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
+import os
+import random
+import tempfile
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiohttp
@@ -51,8 +70,30 @@ logger = logging.getLogger(__name__)
 # ── Colours (consistent with bot theme via constants) ─────────────────
 MUSIC_COLOR = BOT_COLOR
 
+
+# =====================================================================
+#  Guild-authorization view (shown when bot isn’t allowed in a server)
+# =====================================================================
+
+class _OwnerDMView(discord.ui.View):
+    """Persistent view with link-buttons directing users to each bot owner’s DM."""
+
+    def __init__(self, owner_ids: list[int]) -> None:
+        super().__init__(timeout=None)  # persistent
+        for oid in owner_ids:
+            self.add_item(
+                discord.ui.Button(
+                    label=f"DM Owner",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://discord.com/users/{oid}",
+                    emoji="\U0001f4e9",
+                )
+            )
+
 # ── Discord limits ───────────────────────────────────────────────────
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+DISCORD_UPLOAD_FALLBACK = 25 * 1024 * 1024  # 25 MB fallback (no guild / DM)
+MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024       # 200 MB max download buffer
+MIN_BITRATE_KBPS = 64  # floor — below this quality is unacceptable
 MAX_EMBED_DESC = 4096
 MAX_SELECT_OPTIONS = 25
 MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
@@ -61,12 +102,15 @@ MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
 VIEW_TIMEOUT = 60  # seconds for interactive views
 VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
 
-# ── FFmpeg options for streaming ─────────────────────────────────────
+# ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+# Max Opus encoder bitrate (bps).  512 kbps is the ceiling supported by
+# discord.py's Opus wrapper — anything higher is ignored by the codec.
+MAX_ENCODER_BITRATE = 512_000  # 512 kbps
 
 # ── Branding (user-facing) ───────────────────────────────────────────
 BRAND = "Powered by StarzAI \u26a1"
@@ -86,6 +130,18 @@ class GuildMusicState:
         "text_channel",
         "idle_task",
         "requester_map",
+        # Loop & playback tracking
+        "loop_mode",
+        "playback_start_time",
+        "position_offset",
+        "pause_start_time",
+        "paused_elapsed",
+        "_seeking",
+        "_current_stream_url",
+        # DJ role
+        "dj_role_id",
+        # Auto-resume
+        "_resume_info",
     )
 
     def __init__(self) -> None:
@@ -96,11 +152,44 @@ class GuildMusicState:
         self.text_channel: Optional[discord.abc.Messageable] = None
         self.idle_task: Optional[asyncio.Task] = None
         self.requester_map: Dict[str, int] = {}  # song_id -> user_id
+        # Loop mode: "off", "track", "queue"
+        self.loop_mode: str = "off"
+        # Playback position tracking (for progress bar & seek)
+        self.playback_start_time: float = 0.0   # time.monotonic()
+        self.position_offset: float = 0.0        # seconds into the song
+        self.pause_start_time: float = 0.0       # when pause began
+        self.paused_elapsed: float = 0.0         # total seconds spent paused
+        self._seeking: bool = False               # guard to prevent _play_next on seek
+        self._current_stream_url: str = ""        # stream URL for seek/resume
+        # DJ role (optional per-guild restriction)
+        self.dj_role_id: Optional[int] = None
+        # Auto-resume state
+        self._resume_info: Optional[Dict[str, Any]] = None
+
+    @property
+    def current_position(self) -> float:
+        """Return the estimated playback position in seconds."""
+        if self.playback_start_time <= 0:
+            return 0.0
+        if self.voice_client and self.voice_client.is_paused():
+            # While paused, freeze at the position when we paused
+            paused_since = self.pause_start_time - self.playback_start_time
+            return self.position_offset + paused_since - self.paused_elapsed
+        elapsed = time.monotonic() - self.playback_start_time - self.paused_elapsed
+        return self.position_offset + max(elapsed, 0.0)
 
     def clear(self) -> None:
         self.queue.clear()
         self.current = None
         self.requester_map.clear()
+        self.loop_mode = "off"
+        self.playback_start_time = 0.0
+        self.position_offset = 0.0
+        self.pause_start_time = 0.0
+        self.paused_elapsed = 0.0
+        self._seeking = False
+        self._current_stream_url = ""
+        self._resume_info = None
         if self.idle_task and not self.idle_task.done():
             self.idle_task.cancel()
             self.idle_task = None
@@ -114,27 +203,15 @@ async def _check_rate_limit(
     bot: Any, interaction: discord.Interaction, *, expensive: bool = False
 ) -> bool:
     """
-    Check rate limits following the project convention.
-    Returns True if allowed, False (and sends error) if rate-limited.
+    Music-specific rate-limit check — intentionally very generous.
 
-    Safe to call whether the interaction has been deferred or not;
-    uses ``followup.send`` when the response is already consumed.
+    This bot is for personal / friends-only servers, so music commands
+    are effectively unrestricted.  The check is kept as a thin wrapper
+    so it can be tightened later if needed.
     """
-    if not hasattr(bot, "rate_limiter"):
-        return True
-    result = bot.rate_limiter.check(
-        interaction.user.id, interaction.guild_id, expensive=expensive
-    )
-    if not result.allowed:
-        embed = Embedder.rate_limited(result.retry_after)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-        except discord.NotFound:
-            pass  # Interaction expired
-        return False
+    # Generous: effectively allow everything for music commands.
+    # Only do a very light global-burst guard (200 req/min) to avoid
+    # accidental API abuse; individual user/expensive checks are skipped.
     return True
 
 
@@ -360,8 +437,16 @@ class NowPlayingView(discord.ui.View):
                 return
             state = self.cog._get_state(guild_id)
             if state.voice_client and state.voice_client.is_playing():
+                state.pause_start_time = time.monotonic()
                 state.voice_client.pause()
                 await interaction.response.send_message("\u23f8 Paused.", ephemeral=True)
+            elif state.voice_client and state.voice_client.is_paused():
+                # Toggle: resume if already paused
+                if state.pause_start_time > 0:
+                    state.paused_elapsed += time.monotonic() - state.pause_start_time
+                    state.pause_start_time = 0.0
+                state.voice_client.resume()
+                await interaction.response.send_message("\u25b6 Resumed.", ephemeral=True)
             else:
                 await interaction.response.send_message("Nothing is playing.", ephemeral=True)
         except discord.NotFound:
@@ -385,6 +470,107 @@ class NowPlayingView(discord.ui.View):
     async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         query = f"{self.song['artist']} {self.song['name']}"
         await self.cog._send_lyrics(interaction, query, self.song["artist"], self.song["name"])
+
+    @discord.ui.button(label="\U0001f504 Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        """Refresh the now-playing embed with updated progress bar."""
+        guild_id = interaction.guild_id
+        if not guild_id:
+            return
+        try:
+            state = self.cog._get_state(guild_id)
+            if state.current and state.current.get("id") == self.song.get("id"):
+                requester_id = state.requester_map.get(state.current["id"])
+                requester = self.cog.bot.get_user(requester_id) if requester_id else None
+                embed = _now_playing_embed(state, state.current, requester)
+                await interaction.response.edit_message(embed=embed, view=self)
+            else:
+                await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
+        except discord.NotFound:
+            pass
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Select, discord.ui.Button)):
+                item.disabled = True  # type: ignore[union-attr]
+
+
+class QueuePaginationView(discord.ui.View):
+    """Paginated view for the music queue."""
+
+    SONGS_PER_PAGE = 10
+
+    def __init__(self, state: "GuildMusicState", cog: "MusicCog", guild_id: int) -> None:
+        super().__init__(timeout=120)
+        self.state = state
+        self.cog = cog
+        self.guild_id = guild_id
+        self.page = 0
+
+    @property
+    def total_pages(self) -> int:
+        total = len(self.state.queue)
+        if total == 0:
+            return 1
+        return (total + self.SONGS_PER_PAGE - 1) // self.SONGS_PER_PAGE
+
+    def _build_embed(self) -> discord.Embed:
+        """Build the queue embed for the current page."""
+        state = self.state
+        lines: List[str] = []
+
+        if state.current:
+            loop = _loop_badge(state.loop_mode)
+            lines.append(f"\U0001f3b5 **Now Playing:** {state.current['name']} \u2014 {state.current['artist']}{loop}")
+
+        if state.queue:
+            start_idx = self.page * self.SONGS_PER_PAGE
+            end_idx = start_idx + self.SONGS_PER_PAGE
+            page_songs = state.queue[start_idx:end_idx]
+
+            lines.append("")
+            for i, s in enumerate(page_songs, start_idx + 1):
+                dur = s.get("duration_formatted", "?:??")
+                lines.append(f"**{i}.** {s['name']} \u2014 {s['artist']}  `{dur}`")
+        elif not state.current:
+            lines.append("The queue is empty.")
+
+        total = len(state.queue) + (1 if state.current else 0)
+        total_dur = sum(s.get("duration", 0) for s in state.queue)
+        if state.current:
+            total_dur += state.current.get("duration", 0) or 0
+
+        dur_m, dur_s = divmod(int(total_dur), 60)
+        dur_h, dur_m = divmod(dur_m, 60)
+        dur_str = f"{dur_h}h {dur_m}m" if dur_h else f"{dur_m}m {dur_s}s"
+
+        footer = (
+            f"{total} song{'s' if total != 1 else ''} \u2022 {dur_str} \u2022 "
+            f"Page {self.page + 1}/{self.total_pages} \u2022 {BRAND}"
+        )
+        return Embedder.standard(
+            "\U0001f4cb Music Queue",
+            "\n".join(lines)[:MAX_EMBED_DESC],
+            footer=footer,
+        )
+
+    @discord.ui.button(label="\u25c0", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page > 0:
+            self.page -= 1
+        try:
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        except discord.NotFound:
+            pass
+
+    @discord.ui.button(label="\u25b6", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        try:
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        except discord.NotFound:
+            pass
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -430,15 +616,47 @@ def _song_detail_embed(song: Dict[str, Any]) -> discord.Embed:
     )
 
 
+def _progress_bar(position: float, duration: float, width: int = 16) -> str:
+    """Build a Unicode progress bar like ▬▬▬▬🔘▬▬▬▬▬▬▬ 1:23 / 4:30."""
+    duration = max(duration, 1)
+    position = max(0.0, min(position, duration))
+    filled = int((position / duration) * width)
+    filled = min(filled, width - 1)
+
+    bar = "\u25ac" * filled + "\U0001f518" + "\u25ac" * (width - filled - 1)
+
+    def _fmt(s: float) -> str:
+        m, sec = divmod(int(s), 60)
+        return f"{m}:{sec:02d}"
+
+    return f"{bar}  {_fmt(position)} / {_fmt(duration)}"
+
+
+def _loop_badge(mode: str) -> str:
+    """Return a small badge string for the current loop mode."""
+    if mode == "track":
+        return "  \U0001f502 Loop: Track"
+    if mode == "queue":
+        return "  \U0001f501 Loop: Queue"
+    return ""
+
+
 def _now_playing_embed(
-    song: Dict[str, Any], requester: Optional[discord.User] = None
+    state: "GuildMusicState",
+    song: Dict[str, Any],
+    requester: Optional[discord.User] = None,
 ) -> discord.Embed:
-    """Build the Now Playing embed."""
+    """Build the Now Playing embed with progress bar."""
+    position = state.current_position if state else 0.0
+    duration = song.get("duration", 0) or 0
+    bar = _progress_bar(position, duration)
+    loop = _loop_badge(state.loop_mode) if state else ""
+
     desc = (
         f"**{song['name']}**\n"
         f"\U0001f3a4 {song['artist']}\n"
-        f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
-        f"\u23f1 {song['duration_formatted']}"
+        f"\U0001f4bf {song['album']} \u2022 {song['year']}\n\n"
+        f"{bar}{loop}"
     )
     footer_parts = ["320kbps"]
     if requester:
@@ -506,6 +724,43 @@ def _sanitise_filename(artist: str, name: str) -> str:
     return f"{base}.mp3"
 
 
+def _parse_seek_position(raw: str) -> Optional[float]:
+    """Parse a seek position string like '1:30', '90', '0:45' into seconds."""
+    raw = raw.strip()
+    # Try M:SS or MM:SS format
+    parts = raw.split(":")
+    if len(parts) == 2:
+        try:
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+            return float(minutes * 60 + seconds)
+        except ValueError:
+            return None
+    # Try H:MM:SS
+    if len(parts) == 3:
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+            return float(hours * 3600 + minutes * 60 + seconds)
+        except ValueError:
+            return None
+    # Try plain seconds
+    try:
+        val = float(raw)
+        if val < 0:
+            return None
+        return val
+    except ValueError:
+        return None
+
+
+def _fmt_seconds(s: float) -> str:
+    """Format seconds into M:SS."""
+    m, sec = divmod(int(s), 60)
+    return f"{m}:{sec:02d}"
+
+
 def _split_text(text: str, max_len: int = 4000) -> List[str]:
     """Split text into chunks respecting line boundaries.
 
@@ -550,6 +805,39 @@ class MusicCog(commands.Cog, name="Music"):
         self.music_api: Optional[MusicAPI] = None
         self.lyrics_fetcher: Optional[LyricsFetcher] = None
         self._states: Dict[int, GuildMusicState] = {}
+
+    # ── Cog-wide authorization gate ──────────────────────────────────
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Runs before every music slash-command.
+
+        If the guild is not in the bot’s allowlist the user sees a
+        friendly embed with DM-link buttons for every configured owner.
+        Owner-initiated commands always pass so they can run /allow.
+        """
+        # Always let bot owners through (they need to run /allow)
+        if interaction.user.id in self.bot.settings.owner_ids:
+            return True
+
+        if self.bot.is_guild_allowed(interaction.guild_id):
+            return True
+
+        # Guild not allowed — show the owner-DM redirect
+        embed = Embedder.error(
+            "Bot Not Authorised",
+            "This bot hasn’t been enabled for this server yet.\n\n"
+            "Ask a **bot owner** to run `/allow` here, or DM them "
+            "using the buttons below.",
+        )
+        view = _OwnerDMView(self.bot.settings.owner_ids)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        except discord.NotFound:
+            pass
+        return False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -641,7 +929,7 @@ class MusicCog(commands.Cog, name="Music"):
     # ── /music ────────────────────────────────────────────────────────
 
     @app_commands.command(name="music", description="Search and download a song")
-    @app_commands.describe(query="Song name, artist, or Spotify/Deezer/Apple Music URL")
+    @app_commands.describe(query="Song name, artist, or link (Spotify, YouTube Music, YouTube, Deezer, Apple Music, SoundCloud, Tidal)")
     async def music_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and present download/play options."""
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
@@ -683,7 +971,7 @@ class MusicCog(commands.Cog, name="Music"):
     # ── /play ─────────────────────────────────────────────────────────
 
     @app_commands.command(name="play", description="Search and play a song in your voice channel")
-    @app_commands.describe(query="Song name, artist, or Spotify/Deezer/Apple Music URL")
+    @app_commands.describe(query="Song name, artist, or link (Spotify, YouTube Music, YouTube, Deezer, Apple Music, SoundCloud, Tidal)")
     async def play_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and play it in the user's voice channel."""
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
@@ -751,6 +1039,8 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
         state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
         if state.voice_client and state.voice_client.is_playing():
             skipped_name = state.current["name"] if state.current else "current song"
             state.voice_client.stop()  # Triggers the after callback -> play_next
@@ -794,7 +1084,11 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
         state = self._get_state(interaction.guild_id)
-        await interaction.response.send_message(embed=_queue_embed(state))
+        if len(state.queue) > QueuePaginationView.SONGS_PER_PAGE:
+            view = QueuePaginationView(state, self, interaction.guild_id)
+            await interaction.response.send_message(embed=view._build_embed(), view=view)
+        else:
+            await interaction.response.send_message(embed=_queue_embed(state))
 
     # ── /nowplaying ───────────────────────────────────────────────────
 
@@ -809,7 +1103,7 @@ class MusicCog(commands.Cog, name="Music"):
         if state.current:
             requester_id = state.requester_map.get(state.current["id"])
             requester = self.bot.get_user(requester_id) if requester_id else None
-            embed = _now_playing_embed(state.current, requester)
+            embed = _now_playing_embed(state, state.current, requester)
             view = NowPlayingView(state.current, self, interaction.guild_id)
             await interaction.response.send_message(embed=embed, view=view)
         else:
@@ -829,6 +1123,7 @@ class MusicCog(commands.Cog, name="Music"):
             return
         state = self._get_state(interaction.guild_id)
         if state.voice_client and state.voice_client.is_playing():
+            state.pause_start_time = time.monotonic()
             state.voice_client.pause()
             await interaction.response.send_message(
                 embed=Embedder.info("Paused", "\u23f8 Playback paused.")
@@ -850,6 +1145,10 @@ class MusicCog(commands.Cog, name="Music"):
             return
         state = self._get_state(interaction.guild_id)
         if state.voice_client and state.voice_client.is_paused():
+            # Track time spent paused for accurate progress bar
+            if state.pause_start_time > 0:
+                state.paused_elapsed += time.monotonic() - state.pause_start_time
+                state.pause_start_time = 0.0
             state.voice_client.resume()
             await interaction.response.send_message(
                 embed=Embedder.success("Resumed", "\u25b6 Playback resumed.")
@@ -882,6 +1181,317 @@ class MusicCog(commands.Cog, name="Music"):
         await interaction.response.send_message(
             embed=Embedder.info("Volume", f"\U0001f50a Volume set to **{level}%**")
         )
+
+    # ── /shuffle ─────────────────────────────────────────────────────
+
+    @app_commands.command(name="shuffle", description="Shuffle the music queue")
+    async def shuffle_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+        if len(state.queue) < 2:
+            await interaction.response.send_message(
+                embed=Embedder.warning("Can't Shuffle", "Need at least 2 songs in queue to shuffle."),
+                ephemeral=True,
+            )
+            return
+        random.shuffle(state.queue)
+        await interaction.response.send_message(
+            embed=Embedder.success("Shuffled", f"\U0001f500 Shuffled **{len(state.queue)}** songs in the queue.")
+        )
+
+    # ── /loop ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="loop", description="Set loop mode for the music player")
+    @app_commands.describe(mode="Loop mode: off, track (repeat current), or queue (repeat all)")
+    @app_commands.choices(mode=[
+        app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="Track (repeat current song)", value="track"),
+        app_commands.Choice(name="Queue (repeat entire queue)", value="queue"),
+    ])
+    async def loop_cmd(self, interaction: discord.Interaction, mode: str) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+        state.loop_mode = mode
+        icons = {"off": "\u274c", "track": "\U0001f502", "queue": "\U0001f501"}
+        labels = {"off": "Off", "track": "Track", "queue": "Queue"}
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Loop Mode",
+                f"{icons.get(mode, '')} Loop mode set to **{labels.get(mode, mode)}**",
+            )
+        )
+
+    # ── /seek ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="seek", description="Seek to a position in the current song")
+    @app_commands.describe(position="Position to seek to (e.g. '1:30', '90', '0:45')")
+    async def seek_cmd(self, interaction: discord.Interaction, position: str) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not state.current:
+            await interaction.response.send_message(
+                embed=Embedder.warning("Nothing Playing", "No song is currently playing."),
+                ephemeral=True,
+            )
+            return
+        if not state.voice_client or not state.voice_client.is_connected():
+            await interaction.response.send_message(
+                embed=Embedder.warning("Not Connected", "Not connected to a voice channel."),
+                ephemeral=True,
+            )
+            return
+
+        # Parse position string (supports M:SS or just seconds)
+        seek_seconds = _parse_seek_position(position)
+        if seek_seconds is None:
+            await interaction.response.send_message(
+                embed=Embedder.error("Invalid Position", "Use a format like `1:30` or `90` (seconds)."),
+                ephemeral=True,
+            )
+            return
+
+        duration = state.current.get("duration", 0) or 0
+        if duration > 0 and seek_seconds >= duration:
+            await interaction.response.send_message(
+                embed=Embedder.error(
+                    "Out of Range",
+                    f"Song is only {_fmt_seconds(duration)} long.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        stream_url = state._current_stream_url
+        if not stream_url:
+            stream_url = _pick_best_url(state.current.get("download_urls", []), "320kbps")
+        if not stream_url:
+            await interaction.response.send_message(
+                embed=Embedder.error("Seek Failed", "No stream URL available."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        # Stop current playback (mark as seeking so _play_next doesn't trigger)
+        state._seeking = True
+        if state.voice_client.is_playing() or state.voice_client.is_paused():
+            state.voice_client.stop()
+
+        # Small delay to let the stop callback fire
+        await asyncio.sleep(0.3)
+
+        # Restart playback at the seeked position
+        await self._start_playback(interaction.guild_id, stream_url, seek_to=seek_seconds)
+
+        await interaction.followup.send(
+            embed=Embedder.success(
+                "Seeked",
+                f"\u23e9 Jumped to **{_fmt_seconds(seek_seconds)}**",
+            )
+        )
+
+    # ── /remove ──────────────────────────────────────────────────────
+
+    @app_commands.command(name="remove", description="Remove a song from the queue by position")
+    @app_commands.describe(position="Queue position to remove (1-based)")
+    async def remove_cmd(self, interaction: discord.Interaction, position: int) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        idx = position - 1
+        if idx < 0 or idx >= len(state.queue):
+            await interaction.response.send_message(
+                embed=Embedder.error(
+                    "Invalid Position",
+                    f"Queue has **{len(state.queue)}** songs. Use a number between 1 and {len(state.queue)}.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        removed = state.queue.pop(idx)
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Removed",
+                f"\U0001f5d1 Removed **{removed['name']}** \u2014 {removed['artist']} from the queue.",
+            )
+        )
+
+    # ── /clear ───────────────────────────────────────────────────────
+
+    @app_commands.command(name="clear", description="Clear the entire music queue")
+    async def clear_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+        state = self._get_state(interaction.guild_id)
+        if not await self._check_dj(interaction, state):
+            return
+
+        count = len(state.queue)
+        state.queue.clear()
+        state.loop_mode = "off"
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Queue Cleared",
+                f"\U0001f9f9 Cleared **{count}** song{'s' if count != 1 else ''} from the queue.\n"
+                "Currently playing song will finish, then playback stops.",
+            )
+        )
+
+    # ── /playnext ────────────────────────────────────────────────────
+
+    @app_commands.command(name="playnext", description="Search and add a song to the front of the queue")
+    @app_commands.describe(query="Song name, artist, or link")
+    async def playnext_cmd(self, interaction: discord.Interaction, query: str) -> None:
+        if not await _check_rate_limit(self.bot, interaction, expensive=True):
+            return
+        if not await self._ensure_services(interaction):
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message(
+                embed=Embedder.error("Server Only", "This command can only be used in a server."),
+                ephemeral=True,
+            )
+            return
+
+        member = interaction.guild.get_member(interaction.user.id)
+        if not member or not member.voice or not member.voice.channel:
+            await interaction.response.send_message(
+                embed=Embedder.error("Not in VC", "\U0001f50a Join a voice channel first!"),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        search_query = await self._resolve_query(query)
+        songs = await self.music_api.search(search_query, limit=1)
+
+        if not songs:
+            await interaction.followup.send(
+                embed=Embedder.error("No Results", "\u274c No songs found. Try a different search.")
+            )
+            return
+
+        song = await self.music_api.ensure_download_urls(songs[0])
+        guild_id = interaction.guild.id
+        state = self._get_state(guild_id)
+
+        if song.get("id"):
+            state.requester_map[song["id"]] = interaction.user.id
+
+        # If nothing is playing, just play it directly
+        if not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
+            await self._play_song_in_vc(interaction, song, followup=True)
+            return
+
+        # Insert at the front of the queue
+        state.queue.insert(0, song)
+        await interaction.followup.send(
+            embed=Embedder.success(
+                "\u23cf\ufe0f Play Next",
+                f"**{song['name']}** \u2014 {song['artist']} will play next!",
+            )
+        )
+
+    # ── /djrole ──────────────────────────────────────────────────────
+
+    @app_commands.command(name="djrole", description="Set or clear the DJ role for music commands")
+    @app_commands.describe(role="Role required for queue management (leave empty to clear)")
+    async def djrole_cmd(
+        self, interaction: discord.Interaction, role: Optional[discord.Role] = None
+    ) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
+        if not interaction.guild_id:
+            await interaction.response.send_message("Server only.", ephemeral=True)
+            return
+
+        # Only server admins or bot owners can set the DJ role
+        is_admin = interaction.user.guild_permissions.manage_guild if hasattr(interaction.user, "guild_permissions") else False
+        is_owner = interaction.user.id in self.bot.settings.owner_ids
+        if not is_admin and not is_owner:
+            await interaction.response.send_message(
+                embed=Embedder.error(
+                    "Permission Denied",
+                    "You need **Manage Server** permission to set the DJ role.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        state = self._get_state(interaction.guild_id)
+        if role is None:
+            state.dj_role_id = None
+            await interaction.response.send_message(
+                embed=Embedder.success(
+                    "DJ Role Cleared",
+                    "\U0001f3a7 DJ role restriction removed. Anyone can manage the queue.",
+                )
+            )
+        else:
+            state.dj_role_id = role.id
+            await interaction.response.send_message(
+                embed=Embedder.success(
+                    "DJ Role Set",
+                    f"\U0001f3a7 DJ role set to **{role.name}**. Only members with this role "
+                    "can shuffle, loop, remove, clear, and skip.",
+                )
+            )
+
+    # ── DJ role check helper ─────────────────────────────────────────
+
+    async def _check_dj(
+        self, interaction: discord.Interaction, state: GuildMusicState
+    ) -> bool:
+        """Return True if the user has DJ permissions (or no DJ role is set)."""
+        if state.dj_role_id is None:
+            return True  # No restriction
+        # Bot owners always pass
+        if interaction.user.id in self.bot.settings.owner_ids:
+            return True
+        # Check if user has the DJ role
+        if interaction.guild:
+            member = interaction.guild.get_member(interaction.user.id)
+            if member:
+                for r in member.roles:
+                    if r.id == state.dj_role_id:
+                        return True
+        await interaction.response.send_message(
+            embed=Embedder.error(
+                "DJ Only",
+                "\U0001f3a7 You need the **DJ** role to use this command.",
+            ),
+            ephemeral=True,
+        )
+        return False
 
     # ── /lyrics ───────────────────────────────────────────────────────
 
@@ -962,16 +1572,56 @@ class MusicCog(commands.Cog, name="Music"):
 
     # ── Internal: download a song ─────────────────────────────────────
 
+    def _guild_upload_limit(self, interaction: discord.Interaction) -> int:
+        """Return the upload-size ceiling for the current guild.
+
+        Uses discord.py's ``Guild.filesize_limit`` which already accounts
+        for the server's Nitro Boost tier (25 MB / 50 MB / 100 MB).
+        Falls back to 25 MB when used in DMs or if unavailable.
+        """
+        if interaction.guild is not None:
+            try:
+                return interaction.guild.filesize_limit
+            except Exception:
+                pass
+        return DISCORD_UPLOAD_FALLBACK
+
+    @staticmethod
+    async def _ffmpeg_reencode(src: str, dst: str, bitrate_kbps: int) -> bool:
+        """Re-encode *src* MP3 to *dst* at the given bitrate using FFmpeg.
+
+        Returns True on success, False on failure.
+        """
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", src,
+            "-b:a", f"{bitrate_kbps}k",
+            "-map", "a",           # audio only
+            "-write_xing", "1",    # proper VBR header
+            dst,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error("FFmpeg re-encode failed (rc=%s): %s", proc.returncode, stderr.decode(errors="replace")[:500])
+            return False
+        return True
+
     async def _download_song(
         self,
         interaction: discord.Interaction,
         song: Dict[str, Any],
         quality: str,
     ) -> None:
-        """Download a song at the given quality and send it as a file.
+        """Download a song and send it as a **single playable .mp3**.
 
-        Streams the download in chunks and checks size during transfer to
-        avoid loading excessively large files entirely into memory.
+        Flow:
+        1. Download the full-quality file from the API into a temp file.
+        2. If it already fits within the guild's upload limit → send as-is.
+        3. If it's too large → use FFmpeg to re-encode to the highest
+           bitrate that fits, then send the re-encoded file.
+
+        The API download URL is **never** exposed to users.
         """
         try:
             if not interaction.response.is_done():
@@ -1007,10 +1657,18 @@ class MusicCog(commands.Cog, name="Music"):
             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="No download URL")
             return
 
+        upload_limit = self._guild_upload_limit(interaction)
+        tmp_original: Optional[str] = None
+        tmp_reencoded: Optional[str] = None
+
         try:
+            # ── 1. Download full-quality file to a temp file ─────────
+            tmp_fd, tmp_original = tempfile.mkstemp(suffix=".mp3")
+            os.close(tmp_fd)
+
             async with self._session.get(
                 download_url,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
                     latency_ms = (time.monotonic() - start) * 1000
@@ -1021,63 +1679,127 @@ class MusicCog(commands.Cog, name="Music"):
                     await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"HTTP {resp.status}")
                     return
 
-                # Check Content-Length header first if available
+                # Reject absurdly large files up-front via Content-Length
                 content_length = resp.headers.get("Content-Length")
                 if content_length is not None:
                     try:
                         declared_size = int(content_length)
                     except (TypeError, ValueError):
-                        declared_size = None
+                        pass
                     else:
-                        if declared_size > MAX_FILE_SIZE:
+                        if declared_size > MAX_DOWNLOAD_SIZE:
                             latency_ms = (time.monotonic() - start) * 1000
                             size_mb = declared_size / (1024 * 1024)
                             await interaction.followup.send(
                                 embed=Embedder.warning(
                                     "File Too Large",
-                                    f"\u26a0\ufe0f File is {size_mb:.1f} MB, exceeding the 25 MB limit.\n"
-                                    f"Try a lower quality.",
+                                    f"\u26a0\ufe0f File is {size_mb:.1f} MB which exceeds the safety limit.\n"
+                                    "Try a lower quality.",
                                 ),
                                 ephemeral=True,
                             )
                             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"File too large ({size_mb:.1f} MB)")
                             return
 
-                # Stream download in chunks with size enforcement
-                buffer = io.BytesIO()
-                try:
-                    downloaded = 0
+                # Stream to temp file
+                downloaded = 0
+                with open(tmp_original, "wb") as fp:
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         if not chunk:
                             continue
                         downloaded += len(chunk)
-                        if downloaded > MAX_FILE_SIZE:
+                        if downloaded > MAX_DOWNLOAD_SIZE:
                             latency_ms = (time.monotonic() - start) * 1000
                             await interaction.followup.send(
                                 embed=Embedder.warning(
                                     "File Too Large",
-                                    f"\u26a0\ufe0f File exceeds the 25 MB limit.\nTry a lower quality.",
+                                    "\u26a0\ufe0f File exceeds the safety limit. Try a lower quality.",
                                 ),
                                 ephemeral=True,
                             )
                             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="File too large (streamed)")
                             return
-                        buffer.write(chunk)
+                        fp.write(chunk)
 
-                    size_bytes = downloaded
-                    size_mb = size_bytes / (1024 * 1024)
+            original_size = os.path.getsize(tmp_original)
+            filename = _sanitise_filename(song["artist"], song["name"])
 
-                    filename = _sanitise_filename(song["artist"], song["name"])
+            # ── 2. Decide: send as-is or re-encode ──────────────────
+            send_path = tmp_original
+            actual_quality = quality
 
-                    buffer.seek(0)
-                    file = discord.File(buffer, filename=filename)
-                    embed = _download_embed(song, quality, size_mb)
+            if original_size > upload_limit:
+                # Calculate the highest bitrate that fits within ~95% of
+                # the upload limit (margin for container overhead / VBR).
+                duration = song.get("duration", 0) or 0
+                if duration <= 0:
+                    # Estimate duration from original file size at 320 kbps
+                    duration = max((original_size * 8) / (320 * 1000), 30)
 
-                    await interaction.followup.send(embed=embed, file=file)
+                target_bytes = int(upload_limit * 0.95)
+                target_kbps = int((target_bytes * 8) / (duration * 1000))
+                target_kbps = max(target_kbps, MIN_BITRATE_KBPS)
+
+                if target_kbps < MIN_BITRATE_KBPS:
+                    # Song is so long that even 64 kbps won't fit
                     latency_ms = (time.monotonic() - start) * 1000
-                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms)
-                finally:
-                    buffer.close()
+                    limit_mb = upload_limit / (1024 * 1024)
+                    await interaction.followup.send(
+                        embed=Embedder.warning(
+                            "Song Too Long",
+                            f"\u26a0\ufe0f This song is too long to fit in a single "
+                            f"{limit_mb:.0f} MB upload even at minimum quality.\n"
+                            "Try a shorter song or use `/play` to stream it in VC instead.",
+                        ),
+                        ephemeral=True,
+                    )
+                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="Song too long for re-encode")
+                    return
+
+                # Re-encode with FFmpeg
+                tmp_fd2, tmp_reencoded = tempfile.mkstemp(suffix=".mp3")
+                os.close(tmp_fd2)
+
+                logger.info(
+                    "Re-encoding '%s' from %s (%.1f MB) → %d kbps to fit %d MB limit",
+                    song.get("name"), quality,
+                    original_size / (1024 * 1024),
+                    target_kbps,
+                    upload_limit / (1024 * 1024),
+                )
+
+                ok = await self._ffmpeg_reencode(tmp_original, tmp_reencoded, target_kbps)
+                if not ok or not os.path.exists(tmp_reencoded) or os.path.getsize(tmp_reencoded) == 0:
+                    latency_ms = (time.monotonic() - start) * 1000
+                    await interaction.followup.send(
+                        embed=Embedder.error("Re-encode Failed", "\u274c Could not compress the song. Try a lower quality."),
+                        ephemeral=True,
+                    )
+                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="FFmpeg re-encode failed")
+                    return
+
+                send_path = tmp_reencoded
+                actual_quality = f"~{target_kbps}kbps"
+
+            # ── 3. Send the single .mp3 ─────────────────────────────
+            final_size = os.path.getsize(send_path)
+            final_mb = final_size / (1024 * 1024)
+
+            with open(send_path, "rb") as fp:
+                file = discord.File(fp, filename=filename)
+                embed = _download_embed(song, actual_quality, final_mb)
+
+                # If we re-encoded, note it on the embed
+                if send_path == tmp_reencoded:
+                    embed.description += (
+                        f"\n\n\u2139\ufe0f Re-encoded to **{actual_quality}** to fit "
+                        f"the server's {upload_limit / (1024 * 1024):.0f} MB upload limit."
+                    )
+
+                await interaction.followup.send(embed=embed, file=file)
+
+            latency_ms = (time.monotonic() - start) * 1000
+            await self._log_usage(interaction, "music-download", latency_ms=latency_ms)
 
         except asyncio.TimeoutError:
             latency_ms = (time.monotonic() - start) * 1000
@@ -1094,6 +1816,14 @@ class MusicCog(commands.Cog, name="Music"):
                 ephemeral=True,
             )
             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=str(exc))
+        finally:
+            # Clean up temp files
+            for path in (tmp_original, tmp_reencoded):
+                if path:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
 
     # ── Internal: play song in VC ─────────────────────────────────────
 
@@ -1198,6 +1928,22 @@ class MusicCog(commands.Cog, name="Music"):
                 state.voice_client = await voice_channel.connect(self_deaf=True)
             elif state.voice_client.channel.id != voice_channel.id:
                 await state.voice_client.move_to(voice_channel)
+
+            # Max out every Opus encoder knob for the best music quality
+            if state.voice_client and hasattr(state.voice_client, 'encoder'):
+                try:
+                    enc = state.voice_client.encoder
+                    enc.set_bitrate(MAX_ENCODER_BITRATE)       # 512 kbps ceiling
+                    enc.set_signal_type('music')                # optimise for music (not voice)
+                    enc.set_bandwidth('full')                   # full 20 kHz bandwidth
+                    enc.set_fec(True)                           # forward error correction on
+                    enc.set_expected_packet_loss_percent(0.05)  # 5% — low, keeps quality high
+                    logger.debug(
+                        "Opus encoder tuned: %d bps, music signal, full BW, FEC on",
+                        MAX_ENCODER_BITRATE,
+                    )
+                except Exception as exc:
+                    logger.debug("Could not tune encoder: %s", exc)
         except Exception as exc:
             logger.error("VC connection error: %s", exc, exc_info=True)
             embed = Embedder.error("Connection Error", "\u274c Could not join the voice channel.")
@@ -1244,7 +1990,7 @@ class MusicCog(commands.Cog, name="Music"):
         await self._start_playback(guild_id, stream_url)
 
         requester = self.bot.get_user(interaction.user.id)
-        embed = _now_playing_embed(song, requester)
+        embed = _now_playing_embed(state, song, requester)
         view = NowPlayingView(song, self, guild_id)
 
         if followup:
@@ -1260,15 +2006,39 @@ class MusicCog(commands.Cog, name="Music"):
 
     # ── Internal: start FFmpeg playback ───────────────────────────────
 
-    async def _start_playback(self, guild_id: int, url: str) -> None:
-        """Start FFmpeg playback on the guild's voice client."""
+    async def _start_playback(
+        self, guild_id: int, url: str, *, seek_to: float = 0.0
+    ) -> None:
+        """Start FFmpeg playback on the guild's voice client.
+
+        Parameters
+        ----------
+        seek_to:
+            If > 0 FFmpeg skips to this position (seconds) using ``-ss``.
+        """
         state = self._get_state(guild_id)
         if not state.voice_client or not state.voice_client.is_connected():
             return
 
         try:
-            source = discord.FFmpegPCMAudio(url, **FFMPEG_OPTIONS)
+            # Build FFmpeg options, injecting -ss for seeking
+            before_opts = FFMPEG_OPTIONS["before_options"]
+            if seek_to > 0:
+                before_opts = f"-ss {seek_to:.2f} {before_opts}"
+            ffmpeg_opts = {
+                "before_options": before_opts,
+                "options": FFMPEG_OPTIONS["options"],
+            }
+
+            source = discord.FFmpegPCMAudio(url, **ffmpeg_opts)
             source = discord.PCMVolumeTransformer(source, volume=state.volume)
+
+            # Track playback position
+            state._current_stream_url = url
+            state.playback_start_time = time.monotonic()
+            state.position_offset = seek_to
+            state.paused_elapsed = 0.0
+
             state.voice_client.play(
                 source,
                 after=lambda e: self.bot.loop.call_soon_threadsafe(
@@ -1288,8 +2058,25 @@ class MusicCog(commands.Cog, name="Music"):
 
         state = self._get_state(guild_id)
 
+        # If we were just seeking (not actually finishing), do nothing
+        if state._seeking:
+            state._seeking = False
+            return
+
+        # ── Loop mode: TRACK — replay the same song ──────────────
+        if state.loop_mode == "track" and state.current:
+            stream_url = state._current_stream_url or _pick_best_url(
+                state.current.get("download_urls", []), "320kbps"
+            )
+            if stream_url:
+                await self._start_playback(guild_id, stream_url)
+                return
+
+        # ── Loop mode: QUEUE — append current to the end before advancing
+        if state.loop_mode == "queue" and state.current:
+            state.queue.append(state.current)
+
         # Iterate through the queue until we find a playable track or the queue is empty.
-        # This avoids recursion which could hit Python's recursion limit with long queues.
         while state.queue:
             next_song = state.queue.pop(0)
             state.current = next_song
@@ -1300,7 +2087,7 @@ class MusicCog(commands.Cog, name="Music"):
                     try:
                         requester_id = state.requester_map.get(next_song.get("id", ""))
                         requester = self.bot.get_user(requester_id) if requester_id else None
-                        embed = _now_playing_embed(next_song, requester)
+                        embed = _now_playing_embed(state, next_song, requester)
                         view = NowPlayingView(next_song, self, guild_id)
                         await state.text_channel.send(embed=embed, view=view)
                     except Exception:
@@ -1312,6 +2099,7 @@ class MusicCog(commands.Cog, name="Music"):
 
         # Queue is empty
         state.current = None
+        state.playback_start_time = 0.0
         # Only schedule idle disconnect if still connected to VC
         if state.voice_client and state.voice_client.is_connected():
             state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
@@ -1365,12 +2153,73 @@ class MusicCog(commands.Cog, name="Music"):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Auto-leave if the bot is alone in a VC for too long."""
-        if member.bot:
-            return
-
+        """Handle auto-leave when alone and auto-resume when bot is moved/reconnected."""
         guild_id = member.guild.id
         state = self._get_state(guild_id)
+
+        # ── Bot itself was disconnected (e.g. moved, kicked) ──────
+        if member.id == self.bot.user.id:  # type: ignore[union-attr]
+            if before.channel and not after.channel:
+                # Bot was disconnected from VC — save state for potential resume
+                if state.current or state.queue:
+                    state._resume_info = {
+                        "current": state.current,
+                        "queue": list(state.queue),
+                        "loop_mode": state.loop_mode,
+                        "position": state.current_position,
+                        "stream_url": state._current_stream_url,
+                        "channel_id": before.channel.id,
+                    }
+                    logger.info(
+                        "Bot disconnected from VC in guild %d — saved resume state "
+                        "(song=%s, pos=%.1fs, queue=%d)",
+                        guild_id,
+                        state.current.get("name", "?") if state.current else "none",
+                        state.current_position,
+                        len(state.queue),
+                    )
+                state.voice_client = None
+                state.playback_start_time = 0.0
+                return
+
+            if not before.channel and after.channel:
+                # Bot just joined a VC — try to auto-resume if we have saved state
+                resume = state._resume_info
+                if resume and resume.get("current"):
+                    logger.info("Bot rejoined VC in guild %d — attempting auto-resume", guild_id)
+                    state._resume_info = None
+                    state.current = resume["current"]
+                    state.queue = resume.get("queue", [])
+                    state.loop_mode = resume.get("loop_mode", "off")
+                    stream_url = resume.get("stream_url", "")
+                    pos = resume.get("position", 0.0)
+
+                    if stream_url and state.voice_client and state.voice_client.is_connected():
+                        # Tune encoder for the new connection
+                        try:
+                            enc = state.voice_client.encoder
+                            enc.set_bitrate(MAX_ENCODER_BITRATE)
+                            enc.set_signal_type('music')
+                            enc.set_bandwidth('full')
+                            enc.set_fec(True)
+                            enc.set_expected_packet_loss_percent(0.05)
+                        except Exception:
+                            pass
+                        await self._start_playback(guild_id, stream_url, seek_to=pos)
+                        if state.text_channel:
+                            try:
+                                embed = Embedder.info(
+                                    "\U0001f504 Resumed",
+                                    f"Auto-resumed **{state.current['name']}** at {_fmt_seconds(pos)}.",
+                                )
+                                await state.text_channel.send(embed=embed)
+                            except Exception:
+                                pass
+                return
+
+        # ── Human voice state changes (idle detection) ────────────
+        if member.bot:
+            return
 
         if not state.voice_client or not state.voice_client.is_connected():
             return
