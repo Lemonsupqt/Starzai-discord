@@ -12,6 +12,11 @@ Commands:
     /resume  — Resume playback
     /volume  — Set playback volume
     /lyrics  — Search for song lyrics
+
+System requirement:
+    FFmpeg must be installed on the host system (e.g. ``apt install ffmpeg``)
+    for voice channel playback to work.  Without it, /play and VC streaming
+    will fail.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiohttp
@@ -58,6 +64,7 @@ VIEW_TIMEOUT = 60  # seconds for interactive views
 VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
 
 # ── FFmpeg options for streaming ─────────────────────────────────────
+# NOTE: FFmpeg must be installed on the host system for VC playback.
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
@@ -493,7 +500,11 @@ def _split_text(text: str, max_len: int = 4000) -> List[str]:
 # =====================================================================
 
 class MusicCog(commands.Cog, name="Music"):
-    """Music download, VC playback, lyrics, and platform URL resolution."""
+    """Music download, VC playback, lyrics, and platform URL resolution.
+
+    Requires FFmpeg to be installed on the host system for voice
+    channel playback (``apt install ffmpeg``).
+    """
 
     def __init__(self, bot: "StarzaiBot") -> None:
         self.bot = bot
@@ -531,6 +542,54 @@ class MusicCog(commands.Cog, name="Music"):
             self._states[guild_id] = GuildMusicState()
         return self._states[guild_id]
 
+    # ── Service availability guard ─────────────────────────────────────
+
+    def _services_ready(self) -> bool:
+        """Return True if all music services are initialised and available."""
+        return (
+            self._session is not None
+            and self.music_api is not None
+            and self.lyrics_fetcher is not None
+        )
+
+    async def _ensure_services(self, interaction: discord.Interaction) -> bool:
+        """Check services are ready; send error and return False if not."""
+        if self._services_ready():
+            return True
+        await interaction.response.send_message(
+            embed=Embedder.error(
+                "Service Unavailable",
+                "\u274c Music services are not available right now. Please try again later.",
+            ),
+            ephemeral=True,
+        )
+        return False
+
+    # ── Usage logging helper ──────────────────────────────────────────
+
+    async def _log_usage(
+        self,
+        interaction: discord.Interaction,
+        command: str,
+        *,
+        latency_ms: float = 0.0,
+        success: bool = True,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Log command usage to database following project convention."""
+        try:
+            if hasattr(self.bot, "database"):
+                await self.bot.database.log_usage(
+                    user_id=interaction.user.id,
+                    command=command,
+                    guild_id=interaction.guild_id,
+                    latency_ms=latency_ms,
+                    success=success,
+                    error_message=error_message,
+                )
+        except Exception as exc:
+            logger.warning("Failed to log usage for %s: %s", command, exc)
+
     # ── Resolve query (text or URL) ───────────────────────────────────
 
     async def _resolve_query(self, query: str) -> str:
@@ -549,21 +608,28 @@ class MusicCog(commands.Cog, name="Music"):
         """Search for a song and present download/play options."""
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
             return
+        if not await self._ensure_services(interaction):
+            return
 
         await interaction.response.defer()
+        start = time.monotonic()
 
         search_query = await self._resolve_query(query)
         songs = await self.music_api.search(search_query, limit=7)
+
+        latency_ms = (time.monotonic() - start) * 1000
 
         if not songs:
             await interaction.followup.send(
                 embed=Embedder.error("No Results", "\u274c No songs found. Try a different search.")
             )
+            await self._log_usage(interaction, "music", latency_ms=latency_ms, success=False, error_message="No results")
             return
 
         embed = _search_results_embed(search_query, songs)
         view = SongSelectView(songs, self, interaction, for_play=False)
         await interaction.followup.send(embed=embed, view=view)
+        await self._log_usage(interaction, "music", latency_ms=latency_ms)
 
     # ── /play ─────────────────────────────────────────────────────────
 
@@ -572,6 +638,8 @@ class MusicCog(commands.Cog, name="Music"):
     async def play_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and play it in the user's voice channel."""
         if not await _check_rate_limit(self.bot, interaction, expensive=True):
+            return
+        if not await self._ensure_services(interaction):
             return
 
         if not interaction.guild:
@@ -590,14 +658,18 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         await interaction.response.defer()
+        start = time.monotonic()
 
         search_query = await self._resolve_query(query)
         songs = await self.music_api.search(search_query, limit=5)
+
+        latency_ms = (time.monotonic() - start) * 1000
 
         if not songs:
             await interaction.followup.send(
                 embed=Embedder.error("No Results", "\u274c No songs found. Try a different search.")
             )
+            await self._log_usage(interaction, "play", latency_ms=latency_ms, success=False, error_message="No results")
             return
 
         if len(songs) == 1:
@@ -607,6 +679,7 @@ class MusicCog(commands.Cog, name="Music"):
             embed = _search_results_embed(search_query, songs)
             view = SongSelectView(songs, self, interaction, for_play=True)
             await interaction.followup.send(embed=embed, view=view)
+        await self._log_usage(interaction, "play", latency_ms=latency_ms)
 
     # ── /skip ─────────────────────────────────────────────────────────
 
@@ -743,6 +816,8 @@ class MusicCog(commands.Cog, name="Music"):
     async def lyrics_cmd(self, interaction: discord.Interaction, query: str) -> None:
         if not await _check_rate_limit(self.bot, interaction):
             return
+        if not await self._ensure_services(interaction):
+            return
         await self._send_lyrics(interaction, query)
 
     # ── Internal: send lyrics ─────────────────────────────────────────
@@ -761,7 +836,9 @@ class MusicCog(commands.Cog, name="Music"):
         except Exception:
             pass
 
+        start = time.monotonic()
         result = await self.lyrics_fetcher.search(query, artist=artist, title=title)
+        latency_ms = (time.monotonic() - start) * 1000
 
         if not result:
             embed = Embedder.error("Lyrics Not Found", "\u274c Couldn\u2019t find lyrics for that song.")
@@ -769,6 +846,7 @@ class MusicCog(commands.Cog, name="Music"):
                 await interaction.followup.send(embed=embed, ephemeral=True)
             except Exception:
                 pass
+            await self._log_usage(interaction, "lyrics", latency_ms=latency_ms, success=False, error_message="Not found")
             return
 
         if result.get("instrumental"):
@@ -804,6 +882,8 @@ class MusicCog(commands.Cog, name="Music"):
                 await interaction.followup.send(embed=embed)
         except Exception:
             pass
+
+        await self._log_usage(interaction, "lyrics", latency_ms=latency_ms)
 
     # ── Internal: download a song ─────────────────────────────────────
 
@@ -869,33 +949,35 @@ class MusicCog(commands.Cog, name="Music"):
 
                 # Stream download in chunks with size enforcement
                 buffer = io.BytesIO()
-                downloaded = 0
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    if not chunk:
-                        continue
-                    downloaded += len(chunk)
-                    if downloaded > MAX_FILE_SIZE:
-                        size_mb = downloaded / (1024 * 1024)
-                        await interaction.followup.send(
-                            embed=Embedder.warning(
-                                "File Too Large",
-                                f"\u26a0\ufe0f File exceeds the 25 MB limit.\nTry a lower quality.",
-                            ),
-                            ephemeral=True,
-                        )
-                        return
-                    buffer.write(chunk)
+                try:
+                    downloaded = 0
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            continue
+                        downloaded += len(chunk)
+                        if downloaded > MAX_FILE_SIZE:
+                            await interaction.followup.send(
+                                embed=Embedder.warning(
+                                    "File Too Large",
+                                    f"\u26a0\ufe0f File exceeds the 25 MB limit.\nTry a lower quality.",
+                                ),
+                                ephemeral=True,
+                            )
+                            return
+                        buffer.write(chunk)
 
-            size_bytes = downloaded
-            size_mb = size_bytes / (1024 * 1024)
+                    size_bytes = downloaded
+                    size_mb = size_bytes / (1024 * 1024)
 
-            filename = _sanitise_filename(song["artist"], song["name"])
+                    filename = _sanitise_filename(song["artist"], song["name"])
 
-            buffer.seek(0)
-            file = discord.File(buffer, filename=filename)
-            embed = _download_embed(song, quality, size_mb)
+                    buffer.seek(0)
+                    file = discord.File(buffer, filename=filename)
+                    embed = _download_embed(song, quality, size_mb)
 
-            await interaction.followup.send(embed=embed, file=file)
+                    await interaction.followup.send(embed=embed, file=file)
+                finally:
+                    buffer.close()
 
         except asyncio.TimeoutError:
             await interaction.followup.send(
