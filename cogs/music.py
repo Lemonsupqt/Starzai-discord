@@ -83,7 +83,6 @@ class GuildMusicState:
         "current",
         "voice_client",
         "volume",
-        "loop",
         "text_channel",
         "idle_task",
         "requester_map",
@@ -94,7 +93,6 @@ class GuildMusicState:
         self.current: Optional[Dict[str, Any]] = None
         self.voice_client: Optional[discord.VoiceClient] = None
         self.volume: float = 0.5
-        self.loop: bool = False
         self.text_channel: Optional[discord.abc.Messageable] = None
         self.idle_task: Optional[asyncio.Task] = None
         self.requester_map: Dict[str, int] = {}  # song_id -> user_id
@@ -182,6 +180,9 @@ class SongSelectView(discord.ui.View):
         if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
             return
 
+        # Defer early — network work below can exceed Discord's 3s deadline
+        await interaction.response.defer()
+
         idx = int(interaction.data["values"][0])  # type: ignore[index]
         song = self.songs[idx]
 
@@ -190,20 +191,20 @@ class SongSelectView(discord.ui.View):
 
         if self.for_play:
             # Directly play in VC
-            await self.cog._play_song_in_vc(interaction, song)
+            await self.cog._play_song_in_vc(interaction, song, followup=True)
         else:
             # Show quality selection for download
             view = QualitySelectView(song, self.cog, interaction)
             embed = _song_detail_embed(song)
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.edit_original_response(embed=embed, view=view)
 
     async def on_timeout(self) -> None:
         for item in self.children:
             if isinstance(item, (discord.ui.Select, discord.ui.Button)):
                 item.disabled = True  # type: ignore[union-attr]
         try:
-            msg = self.message or await self.original_interaction.original_response()
-            await msg.edit(content="\u23f0 Selection expired.", view=self)
+            if self.message:
+                await self.message.edit(content="\u23f0 Selection expired.", view=self)
         except Exception:
             pass
 
@@ -484,7 +485,15 @@ def _sanitise_filename(artist: str, name: str) -> str:
 
 
 def _split_text(text: str, max_len: int = 4000) -> List[str]:
-    """Split text into chunks respecting line boundaries."""
+    """Split text into chunks respecting line boundaries.
+
+    Guards against non-positive *max_len* (which could otherwise cause an
+    infinite loop) by falling back to a minimal chunk size.
+    """
+    # Ensure max_len is always positive to prevent infinite loops
+    if max_len <= 0:
+        max_len = 200  # minimal safe fallback
+
     if len(text) <= max_len:
         return [text]
 
@@ -626,6 +635,16 @@ class MusicCog(commands.Cog, name="Music"):
 
         latency_ms = (time.monotonic() - start) * 1000
 
+        if songs is None:
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Service Unavailable",
+                    "\u274c Music service is temporarily unavailable. Please try again later.",
+                )
+            )
+            await self._log_usage(interaction, "music", latency_ms=latency_ms, success=False, error_message="API failure")
+            return
+
         if not songs:
             await interaction.followup.send(
                 embed=Embedder.error("No Results", "\u274c No songs found. Try a different search.")
@@ -635,7 +654,8 @@ class MusicCog(commands.Cog, name="Music"):
 
         embed = _search_results_embed(search_query, songs)
         view = SongSelectView(songs, self, interaction, for_play=False)
-        await interaction.followup.send(embed=embed, view=view)
+        msg = await interaction.followup.send(embed=embed, view=view)
+        view.message = msg
         await self._log_usage(interaction, "music", latency_ms=latency_ms)
 
     # ── /play ─────────────────────────────────────────────────────────
@@ -672,6 +692,16 @@ class MusicCog(commands.Cog, name="Music"):
 
         latency_ms = (time.monotonic() - start) * 1000
 
+        if songs is None:
+            await interaction.followup.send(
+                embed=Embedder.error(
+                    "Service Unavailable",
+                    "\u274c Music service is temporarily unavailable. Please try again later.",
+                )
+            )
+            await self._log_usage(interaction, "play", latency_ms=latency_ms, success=False, error_message="API failure")
+            return
+
         if not songs:
             await interaction.followup.send(
                 embed=Embedder.error("No Results", "\u274c No songs found. Try a different search.")
@@ -685,13 +715,16 @@ class MusicCog(commands.Cog, name="Music"):
         else:
             embed = _search_results_embed(search_query, songs)
             view = SongSelectView(songs, self, interaction, for_play=True)
-            await interaction.followup.send(embed=embed, view=view)
+            msg = await interaction.followup.send(embed=embed, view=view)
+            view.message = msg
         await self._log_usage(interaction, "play", latency_ms=latency_ms)
 
     # ── /skip ─────────────────────────────────────────────────────────
 
     @app_commands.command(name="skip", description="Skip the current song")
     async def skip_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -712,6 +745,8 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="music-stop", description="Stop music and leave the voice channel")
     async def music_stop_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -731,6 +766,8 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="queue", description="Show the music queue")
     async def queue_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -741,6 +778,8 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="nowplaying", description="Show the currently playing song")
     async def nowplaying_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -761,6 +800,8 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="pause", description="Pause the current song")
     async def pause_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -780,6 +821,8 @@ class MusicCog(commands.Cog, name="Music"):
 
     @app_commands.command(name="resume", description="Resume playback")
     async def resume_cmd(self, interaction: discord.Interaction) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -800,6 +843,8 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.command(name="volume", description="Set playback volume (0-100)")
     @app_commands.describe(level="Volume level (0-100)")
     async def volume_cmd(self, interaction: discord.Interaction, level: int) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         if not interaction.guild_id:
             await interaction.response.send_message("Server only.", ephemeral=True)
             return
@@ -929,6 +974,7 @@ class MusicCog(commands.Cog, name="Music"):
         start = time.monotonic()
         download_url = _get_url_for_quality(song.get("download_urls", []), quality)
         if not download_url:
+            latency_ms = (time.monotonic() - start) * 1000
             await interaction.followup.send(
                 embed=Embedder.error(
                     "Download Failed",
@@ -936,6 +982,7 @@ class MusicCog(commands.Cog, name="Music"):
                 ),
                 ephemeral=True,
             )
+            await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="No download URL")
             return
 
         try:
@@ -944,10 +991,12 @@ class MusicCog(commands.Cog, name="Music"):
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status != 200:
+                    latency_ms = (time.monotonic() - start) * 1000
                     await interaction.followup.send(
                         embed=Embedder.error("Download Failed", "\u274c Could not download the song file."),
                         ephemeral=True,
                     )
+                    await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"HTTP {resp.status}")
                     return
 
                 # Check Content-Length header first if available
@@ -959,6 +1008,7 @@ class MusicCog(commands.Cog, name="Music"):
                         declared_size = None
                     else:
                         if declared_size > MAX_FILE_SIZE:
+                            latency_ms = (time.monotonic() - start) * 1000
                             size_mb = declared_size / (1024 * 1024)
                             await interaction.followup.send(
                                 embed=Embedder.warning(
@@ -968,6 +1018,7 @@ class MusicCog(commands.Cog, name="Music"):
                                 ),
                                 ephemeral=True,
                             )
+                            await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"File too large ({size_mb:.1f} MB)")
                             return
 
                 # Stream download in chunks with size enforcement
@@ -979,6 +1030,7 @@ class MusicCog(commands.Cog, name="Music"):
                             continue
                         downloaded += len(chunk)
                         if downloaded > MAX_FILE_SIZE:
+                            latency_ms = (time.monotonic() - start) * 1000
                             await interaction.followup.send(
                                 embed=Embedder.warning(
                                     "File Too Large",
@@ -986,6 +1038,7 @@ class MusicCog(commands.Cog, name="Music"):
                                 ),
                                 ephemeral=True,
                             )
+                            await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message="File too large (streamed)")
                             return
                         buffer.write(chunk)
 
@@ -1030,6 +1083,14 @@ class MusicCog(commands.Cog, name="Music"):
         followup: bool = False,
     ) -> None:
         """Join VC (if needed) and play/queue the song."""
+        # Defer early — VC connect + API calls can exceed Discord's 3s deadline
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+                followup = True  # After deferring we must use followup
+        except Exception:
+            pass
+
         # Guard against session being closed (e.g. cog unloaded while UI active)
         if not self._services_ready():
             msg = "\u274c Music services are not available right now. Please try again later."

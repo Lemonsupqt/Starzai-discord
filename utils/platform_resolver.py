@@ -45,6 +45,14 @@ def is_music_url(text: str) -> bool:
     )
 
 
+def _normalize_url(match: re.Match) -> str:
+    """Extract the matched URL and ensure it has an https:// scheme."""
+    raw = match.group(0)
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+    return raw
+
+
 async def resolve_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """
     Resolve a music platform URL to a search query string.
@@ -53,6 +61,11 @@ async def resolve_url(url: str, session: aiohttp.ClientSession) -> Optional[str]
     - Spotify track URLs (via oEmbed)
     - Deezer track URLs (via Deezer public API)
     - Apple Music URLs (extracted from URL path)
+
+    The input text may contain surrounding text; the actual URL is
+    extracted via the regex match.  Schemeless matches (e.g.
+    ``open.spotify.com/...``) are normalised to ``https://`` before
+    resolution.
 
     Returns
     -------
@@ -64,7 +77,7 @@ async def resolve_url(url: str, session: aiohttp.ClientSession) -> Optional[str]
     # ── Spotify ───────────────────────────────────────────────────
     match = SPOTIFY_PATTERN.search(url)
     if match:
-        return await _resolve_spotify(url, session)
+        return await _resolve_spotify(_normalize_url(match), session)
 
     # ── Deezer ────────────────────────────────────────────────────
     match = DEEZER_PATTERN.search(url)
