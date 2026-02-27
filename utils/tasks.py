@@ -27,9 +27,9 @@ class BackgroundTasks:
         """Clean up old messages daily (runs every 24 hours)."""
         try:
             deleted_count = await self.bot.database.cleanup_old_messages(days=30)
-            logger.info(f"🧹 Cleaned up {deleted_count} old messages (>30 days)")
+            logger.info("🧹 Cleaned up %d old messages (>30 days)", deleted_count)
         except Exception as e:
-            logger.error(f"Error during cleanup task: {e}", exc_info=True)
+            logger.error("Error during cleanup task: %s", e, exc_info=True)
 
     @cleanup_task.before_loop
     async def before_cleanup(self):

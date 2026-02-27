@@ -215,7 +215,7 @@ class ChatCog(commands.Cog, name="Chat"):
 
             async for chunk in self.bot.llm.chat_stream(messages, model=model):
                 collected += chunk
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
 
                 if msg is None:
                     msg = await interaction.followup.send(
@@ -420,7 +420,7 @@ class ChatCog(commands.Cog, name="Chat"):
 
             async for chunk in self.bot.llm.chat_stream(context_messages, model=model):
                 collected += chunk
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 if reply is None:
                     reply = await interaction.followup.send(
                         embed=Embedder.streaming(collected), wait=True
@@ -671,7 +671,7 @@ class ChatCog(commands.Cog, name="Chat"):
             async def update_progress(status: str):
                 try:
                     await progress_msg.edit(content=status)
-                except:
+                except Exception:
                     pass
             
             # Run MULTI-AGENT ANALYSIS PIPELINE
@@ -736,12 +736,12 @@ class ChatCog(commands.Cog, name="Chat"):
             view.message = progress_msg
             
         except Exception as e:
-            logger.error(f"Error analyzing user: {e}", exc_info=True)
+            logger.error("Error analyzing user: %s", e, exc_info=True)
             try:
                 await progress_msg.edit(
                     content=f"❌ An error occurred while analyzing {user.display_name}: {str(e)}"
                 )
-            except:
+            except Exception:
                 await interaction.followup.send(
                     f"❌ An error occurred while analyzing {user.display_name}: {str(e)}",
                     ephemeral=True
@@ -950,17 +950,17 @@ Focus on observable patterns, not judgments. Be specific with examples when poss
             view.message = await interaction.original_response()
             
         except Exception as e:
-            logger.error(f"Error re-analyzing: {e}", exc_info=True)
+            logger.error("Error re-analyzing: %s", e, exc_info=True)
             await interaction.followup.send(
                 f"❌ Error re-analyzing with {model}: {str(e)}",
                 ephemeral=True
             )
-    @app_commands.guild_only()
 
     @app_commands.command(
         name="my-stats",
         description="📊 View your own personality analysis and statistics"
     )
+    @app_commands.guild_only()
     async def my_stats(self, interaction: discord.Interaction) -> None:
         """Quick access to analyze yourself."""
         # Just call analyze_user with the interaction user
@@ -1171,12 +1171,12 @@ Format with bullet points and emojis. Be insightful and respectful."""
             await progress_msg.edit(content=None, embed=embed)
             
         except Exception as e:
-            logger.error(f"Error comparing users: {e}", exc_info=True)
+            logger.error("Error comparing users: %s", e, exc_info=True)
             try:
                 await progress_msg.edit(
                     content=f"❌ An error occurred during comparison: {str(e)}"
                 )
-            except:
+            except Exception:
                 await interaction.followup.send(
                     f"❌ An error occurred during comparison: {str(e)}",
                     ephemeral=True
@@ -1226,7 +1226,7 @@ Format with bullet points and emojis. Be insightful and respectful."""
                                     f"📊 Progress: {channels_searched}/{total_channels} channels\n"
                                     f"💬 Found: {len(messages_found):,} messages so far..."
                         )
-                    except:
+                    except Exception:
                         pass  # Ignore edit failures
                 
                 # Search this channel
@@ -1252,7 +1252,7 @@ Format with bullet points and emojis. Be insightful and respectful."""
                         f"💬 Found: {len(messages_found):,} messages\n"
                         f"🧠 Analyzing now..."
             )
-        except:
+        except Exception:
             pass
         
         return messages_found
@@ -1367,10 +1367,10 @@ Format with bullet points and emojis. Be insightful and respectful."""
                     
         except discord.Forbidden:
             # No permission to read message history
-            logger.warning(f"No permission to read history in channel {message.channel.id}")
+            logger.warning("No permission to read history in channel %s", message.channel.id)
             return ""
         except Exception as e:
-            logger.error(f"Error fetching message context: {e}", exc_info=True)
+            logger.error("Error fetching message context: %s", e, exc_info=True)
             return ""
         
         search_scope = "server-wide" if search_server else f"#{message.channel.name}"
