@@ -6,9 +6,11 @@ Loads configuration, initializes services, and starts the bot.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Set
 
 import discord
 from aiohttp import web
@@ -95,6 +97,42 @@ class StarzaiBot(commands.Bot):
         self._message_counts: TTLCache[tuple[int, int], int] = TTLCache(
             maxsize=10_000, ttl=3600
         )
+
+        # Guild allowlist — only these guilds can use the bot
+        self._allowed_guilds_path = Path("data/allowed_guilds.json")
+        self.allowed_guilds: Set[int] = self._load_allowed_guilds()
+
+    # ── Guild allowlist persistence ──────────────────────────────────
+
+    def _load_allowed_guilds(self) -> Set[int]:
+        """Load the set of allowed guild IDs from disk."""
+        try:
+            if self._allowed_guilds_path.exists():
+                data = json.loads(self._allowed_guilds_path.read_text())
+                if isinstance(data, list):
+                    return {int(g) for g in data}
+        except Exception as exc:
+            logger.warning("Failed to load allowed guilds: %s", exc)
+        return set()
+
+    def save_allowed_guilds(self) -> None:
+        """Persist the allowed guild set to disk."""
+        try:
+            self._allowed_guilds_path.parent.mkdir(parents=True, exist_ok=True)
+            self._allowed_guilds_path.write_text(
+                json.dumps(sorted(self.allowed_guilds))
+            )
+        except Exception as exc:
+            logger.warning("Failed to save allowed guilds: %s", exc)
+
+    def is_guild_allowed(self, guild_id: Optional[int]) -> bool:
+        """Return True if *guild_id* is in the allowlist (or no list configured)."""
+        if guild_id is None:
+            return True  # DMs are always allowed
+        # If the allowlist is empty, deny by default (require explicit /allow)
+        if not self.allowed_guilds:
+            return False
+        return guild_id in self.allowed_guilds
 
     # ── Startup ──────────────────────────────────────────────────────
 

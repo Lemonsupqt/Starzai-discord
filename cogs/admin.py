@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 import platform
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import discord
 from discord import app_commands
@@ -143,6 +143,104 @@ class AdminCog(commands.Cog, name="Admin"):
         )
         logger.info("Shutdown initiated by %s", interaction.user)
         await self.bot.close()
+
+    # ── /allow ───────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="allow",
+        description="🔒 Allow a guild to use the bot (owner only)",
+    )
+    @app_commands.describe(guild_id="The guild/server ID to authorise (defaults to the current server)")
+    @_is_owner()
+    async def allow_cmd(
+        self, interaction: discord.Interaction, guild_id: Optional[str] = None
+    ) -> None:
+        resolved = int(guild_id) if guild_id else (interaction.guild_id if interaction.guild_id else None)
+        if resolved is None:
+            await interaction.response.send_message(
+                embed=Embedder.error("No Guild", "Provide a guild ID or run this in a server."),
+                ephemeral=True,
+            )
+            return
+
+        self.bot.allowed_guilds.add(resolved)
+        self.bot.save_allowed_guilds()
+
+        guild_obj = self.bot.get_guild(resolved)
+        name = guild_obj.name if guild_obj else str(resolved)
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Guild Allowed",
+                f"**{name}** (`{resolved}`) can now use the bot.",
+            ),
+            ephemeral=True,
+        )
+        logger.info("Guild %s allowed by %s", resolved, interaction.user)
+
+    # ── /disallow ────────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="disallow",
+        description="🔒 Revoke a guild's access to the bot (owner only)",
+    )
+    @app_commands.describe(guild_id="The guild/server ID to revoke (defaults to current server)")
+    @_is_owner()
+    async def disallow_cmd(
+        self, interaction: discord.Interaction, guild_id: Optional[str] = None
+    ) -> None:
+        resolved = int(guild_id) if guild_id else (interaction.guild_id if interaction.guild_id else None)
+        if resolved is None:
+            await interaction.response.send_message(
+                embed=Embedder.error("No Guild", "Provide a guild ID or run this in a server."),
+                ephemeral=True,
+            )
+            return
+
+        self.bot.allowed_guilds.discard(resolved)
+        self.bot.save_allowed_guilds()
+
+        guild_obj = self.bot.get_guild(resolved)
+        name = guild_obj.name if guild_obj else str(resolved)
+        await interaction.response.send_message(
+            embed=Embedder.success(
+                "Guild Removed",
+                f"**{name}** (`{resolved}`) has been removed from the allowlist.",
+            ),
+            ephemeral=True,
+        )
+        logger.info("Guild %s disallowed by %s", resolved, interaction.user)
+
+    # ── /allowlist ───────────────────────────────────────────────────
+
+    @app_commands.command(
+        name="allowlist",
+        description="🔒 Show all allowed guilds (owner only)",
+    )
+    @_is_owner()
+    async def allowlist_cmd(self, interaction: discord.Interaction) -> None:
+        if not self.bot.allowed_guilds:
+            await interaction.response.send_message(
+                embed=Embedder.info(
+                    "Allowlist Empty",
+                    "No guilds are currently allowed. Use `/allow` to add one.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        lines = []
+        for gid in sorted(self.bot.allowed_guilds):
+            guild_obj = self.bot.get_guild(gid)
+            name = guild_obj.name if guild_obj else "Unknown"
+            lines.append(f"• **{name}** (`{gid}`)")
+
+        await interaction.response.send_message(
+            embed=Embedder.standard(
+                "📝 Allowed Guilds",
+                "\n".join(lines),
+            ),
+            ephemeral=True,
+        )
 
     # ── /usage ───────────────────────────────────────────────────────
 

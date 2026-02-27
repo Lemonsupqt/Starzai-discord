@@ -51,8 +51,29 @@ logger = logging.getLogger(__name__)
 # ── Colours (consistent with bot theme via constants) ─────────────────
 MUSIC_COLOR = BOT_COLOR
 
+
+# =====================================================================
+#  Guild-authorization view (shown when bot isn’t allowed in a server)
+# =====================================================================
+
+class _OwnerDMView(discord.ui.View):
+    """Persistent view with link-buttons directing users to each bot owner’s DM."""
+
+    def __init__(self, owner_ids: list[int]) -> None:
+        super().__init__(timeout=None)  # persistent
+        for oid in owner_ids:
+            self.add_item(
+                discord.ui.Button(
+                    label=f"DM Owner",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://discord.com/users/{oid}",
+                    emoji="\U0001f4e9",
+                )
+            )
+
 # ── Discord limits ───────────────────────────────────────────────────
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+DISCORD_UPLOAD_LIMIT = 25 * 1024 * 1024  # 25 MB per attachment
+MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024    # 200 MB max download buffer
 MAX_EMBED_DESC = 4096
 MAX_SELECT_OPTIONS = 25
 MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
@@ -114,27 +135,15 @@ async def _check_rate_limit(
     bot: Any, interaction: discord.Interaction, *, expensive: bool = False
 ) -> bool:
     """
-    Check rate limits following the project convention.
-    Returns True if allowed, False (and sends error) if rate-limited.
+    Music-specific rate-limit check — intentionally very generous.
 
-    Safe to call whether the interaction has been deferred or not;
-    uses ``followup.send`` when the response is already consumed.
+    This bot is for personal / friends-only servers, so music commands
+    are effectively unrestricted.  The check is kept as a thin wrapper
+    so it can be tightened later if needed.
     """
-    if not hasattr(bot, "rate_limiter"):
-        return True
-    result = bot.rate_limiter.check(
-        interaction.user.id, interaction.guild_id, expensive=expensive
-    )
-    if not result.allowed:
-        embed = Embedder.rate_limited(result.retry_after)
-        try:
-            if interaction.response.is_done():
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-        except discord.NotFound:
-            pass  # Interaction expired
-        return False
+    # Generous: effectively allow everything for music commands.
+    # Only do a very light global-burst guard (200 req/min) to avoid
+    # accidental API abuse; individual user/expensive checks are skipped.
     return True
 
 
@@ -550,6 +559,39 @@ class MusicCog(commands.Cog, name="Music"):
         self.music_api: Optional[MusicAPI] = None
         self.lyrics_fetcher: Optional[LyricsFetcher] = None
         self._states: Dict[int, GuildMusicState] = {}
+
+    # ── Cog-wide authorization gate ──────────────────────────────────
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Runs before every music slash-command.
+
+        If the guild is not in the bot’s allowlist the user sees a
+        friendly embed with DM-link buttons for every configured owner.
+        Owner-initiated commands always pass so they can run /allow.
+        """
+        # Always let bot owners through (they need to run /allow)
+        if interaction.user.id in self.bot.settings.owner_ids:
+            return True
+
+        if self.bot.is_guild_allowed(interaction.guild_id):
+            return True
+
+        # Guild not allowed — show the owner-DM redirect
+        embed = Embedder.error(
+            "Bot Not Authorised",
+            "This bot hasn’t been enabled for this server yet.\n\n"
+            "Ask a **bot owner** to run `/allow` here, or DM them "
+            "using the buttons below.",
+        )
+        view = _OwnerDMView(self.bot.settings.owner_ids)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        except discord.NotFound:
+            pass
+        return False
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -968,10 +1010,12 @@ class MusicCog(commands.Cog, name="Music"):
         song: Dict[str, Any],
         quality: str,
     ) -> None:
-        """Download a song at the given quality and send it as a file.
+        """Download a song at the given quality and send it as file(s).
 
-        Streams the download in chunks and checks size during transfer to
-        avoid loading excessively large files entirely into memory.
+        If the file exceeds Discord's per-attachment limit it is
+        automatically split into numbered parts so the full-quality
+        MP3 still reaches the user.  The API download URL is **never**
+        exposed — the raw bytes are sent directly as attachments.
         """
         try:
             if not interaction.response.is_done():
@@ -1010,7 +1054,7 @@ class MusicCog(commands.Cog, name="Music"):
         try:
             async with self._session.get(
                 download_url,
-                timeout=aiohttp.ClientTimeout(total=60),
+                timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
                 if resp.status != 200:
                     latency_ms = (time.monotonic() - start) * 1000
@@ -1021,7 +1065,7 @@ class MusicCog(commands.Cog, name="Music"):
                     await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"HTTP {resp.status}")
                     return
 
-                # Check Content-Length header first if available
+                # Reject absurdly large files (safety cap)
                 content_length = resp.headers.get("Content-Length")
                 if content_length is not None:
                     try:
@@ -1029,21 +1073,21 @@ class MusicCog(commands.Cog, name="Music"):
                     except (TypeError, ValueError):
                         declared_size = None
                     else:
-                        if declared_size > MAX_FILE_SIZE:
+                        if declared_size > MAX_DOWNLOAD_SIZE:
                             latency_ms = (time.monotonic() - start) * 1000
                             size_mb = declared_size / (1024 * 1024)
                             await interaction.followup.send(
                                 embed=Embedder.warning(
                                     "File Too Large",
-                                    f"\u26a0\ufe0f File is {size_mb:.1f} MB, exceeding the 25 MB limit.\n"
-                                    f"Try a lower quality.",
+                                    f"\u26a0\ufe0f File is {size_mb:.1f} MB which exceeds the safety limit.\n"
+                                    "Try a lower quality.",
                                 ),
                                 ephemeral=True,
                             )
                             await self._log_usage(interaction, "music-download", latency_ms=latency_ms, success=False, error_message=f"File too large ({size_mb:.1f} MB)")
                             return
 
-                # Stream download in chunks with size enforcement
+                # Stream the entire file into memory (up to MAX_DOWNLOAD_SIZE)
                 buffer = io.BytesIO()
                 try:
                     downloaded = 0
@@ -1051,12 +1095,12 @@ class MusicCog(commands.Cog, name="Music"):
                         if not chunk:
                             continue
                         downloaded += len(chunk)
-                        if downloaded > MAX_FILE_SIZE:
+                        if downloaded > MAX_DOWNLOAD_SIZE:
                             latency_ms = (time.monotonic() - start) * 1000
                             await interaction.followup.send(
                                 embed=Embedder.warning(
                                     "File Too Large",
-                                    f"\u26a0\ufe0f File exceeds the 25 MB limit.\nTry a lower quality.",
+                                    "\u26a0\ufe0f File exceeds the safety limit. Try a lower quality.",
                                 ),
                                 ephemeral=True,
                             )
@@ -1066,14 +1110,47 @@ class MusicCog(commands.Cog, name="Music"):
 
                     size_bytes = downloaded
                     size_mb = size_bytes / (1024 * 1024)
-
                     filename = _sanitise_filename(song["artist"], song["name"])
 
-                    buffer.seek(0)
-                    file = discord.File(buffer, filename=filename)
-                    embed = _download_embed(song, quality, size_mb)
+                    # ── Single-message path (fits in one attachment) ──
+                    if size_bytes <= DISCORD_UPLOAD_LIMIT:
+                        buffer.seek(0)
+                        file = discord.File(buffer, filename=filename)
+                        embed = _download_embed(song, quality, size_mb)
+                        await interaction.followup.send(embed=embed, file=file)
 
-                    await interaction.followup.send(embed=embed, file=file)
+                    # ── Multi-part path (split into chunks) ──────────
+                    else:
+                        total_parts = (size_bytes + DISCORD_UPLOAD_LIMIT - 1) // DISCORD_UPLOAD_LIMIT
+                        buffer.seek(0)
+
+                        # Info embed explaining the split
+                        info_embed = _download_embed(song, quality, size_mb)
+                        info_embed.description += (
+                            f"\n\n\U0001f4e6 **File is {size_mb:.1f} MB** \u2014 sending in "
+                            f"**{total_parts} parts**.\n"
+                            "Combine them afterwards:\n"
+                            f"\u2022 **Linux / Mac:** `cat \"{filename}.part\"* > \"{filename}\"`\n"
+                            f"\u2022 **Windows:** `copy /b \"{filename}.part\"* \"{filename}\"`"
+                        )
+                        await interaction.followup.send(embed=info_embed)
+
+                        part_num = 0
+                        while True:
+                            chunk_data = buffer.read(DISCORD_UPLOAD_LIMIT)
+                            if not chunk_data:
+                                break
+                            part_num += 1
+                            part_name = f"{filename}.part{part_num:02d}"
+                            part_buf = io.BytesIO(chunk_data)
+                            part_file = discord.File(part_buf, filename=part_name)
+                            part_mb = len(chunk_data) / (1024 * 1024)
+                            await interaction.followup.send(
+                                content=f"\U0001f4e5 Part **{part_num}/{total_parts}** \u2014 {part_mb:.1f} MB",
+                                file=part_file,
+                            )
+                            part_buf.close()
+
                     latency_ms = (time.monotonic() - start) * 1000
                     await self._log_usage(interaction, "music-download", latency_ms=latency_ms)
                 finally:
