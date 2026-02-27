@@ -100,7 +100,7 @@ class Privacy(commands.Cog):
         )
 
         embed.set_footer(
-            text="Use /forget-me to delete all your data • Last updated: 2024"
+            text="Use /forget-me to delete all your data • Last updated: 2025"
         )
 
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -168,11 +168,11 @@ class Privacy(commands.Cog):
                         embed=success_embed, view=None
                     )
                     logger.info(
-                        f"User {button_interaction.user.id} deleted all their data"
+                        "User %s deleted all their data", button_interaction.user.id
                     )
 
                 except Exception as e:
-                    logger.error(f"Error deleting user data: {e}", exc_info=True)
+                    logger.error("Error deleting user data: %s", e, exc_info=True)
                     error_embed = Embedder.error(
                         "Deletion Failed",
                         "An error occurred while deleting your data. Please try again later.",
@@ -297,7 +297,7 @@ class Privacy(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
-            logger.error(f"Error fetching user data: {e}", exc_info=True)
+            logger.error("Error fetching user data: %s", e, exc_info=True)
             await interaction.followup.send(
                 embed=Embedder.error(
                     "Error",

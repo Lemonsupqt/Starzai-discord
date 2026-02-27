@@ -13,6 +13,7 @@ from typing import Optional
 import discord
 from aiohttp import web
 from cachetools import TTLCache
+from discord import app_commands
 from discord.ext import commands
 
 from config.settings import Settings
@@ -65,7 +66,7 @@ class StarzaiBot(commands.Bot):
         intents.guilds = True           # Guild (server) events
         intents.messages = True         # Message events
         intents.reactions = True        # Reaction events
-        intents.typing = True           # Typing indicators
+        intents.typing = False          # Disabled — not used, reduces gateway traffic
 
         super().__init__(
             command_prefix="!",  # Slash commands are primary
@@ -163,7 +164,7 @@ class StarzaiBot(commands.Bot):
                     str(message.author.id), str(message.guild.id), recent
                 )
         except Exception as e:
-            logger.error(f"Error storing message: {e}", exc_info=True)
+            logger.error("Error storing message: %s", e, exc_info=True)
 
         # Process commands (important for prefix commands if any)
         await self.process_commands(message)
@@ -199,6 +200,23 @@ class StarzaiBot(commands.Bot):
                 "An unexpected error occurred. Please try again later.",
             )
         )
+
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
+        """Global handler for unhandled slash-command errors."""
+        logger.error("Unhandled app command error: %s", error, exc_info=error)
+        embed = Embedder.error(
+            "Something went wrong",
+            "An unexpected error occurred. Please try again later.",
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception:
+            pass  # Interaction may have expired
 
     # ── Health Check Server ──────────────────────────────────────────
 
