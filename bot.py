@@ -46,6 +46,7 @@ COGS = [
     "cogs.games",
     "cogs.admin",
     "cogs.privacy",
+    "cogs.music",
 ]
 
 
