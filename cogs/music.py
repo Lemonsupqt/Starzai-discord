@@ -85,12 +85,15 @@ MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
 VIEW_TIMEOUT = 60  # seconds for interactive views
 VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
 
-# ── FFmpeg options for streaming ─────────────────────────────────────
+# ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
 }
+# Max Opus encoder bitrate (bps).  512 kbps is the ceiling supported by
+# discord.py's Opus wrapper — anything higher is ignored by the codec.
+MAX_ENCODER_BITRATE = 512_000  # 512 kbps
 
 # ── Branding (user-facing) ───────────────────────────────────────────
 BRAND = "Powered by StarzAI \u26a1"
@@ -1363,6 +1366,14 @@ class MusicCog(commands.Cog, name="Music"):
                 state.voice_client = await voice_channel.connect(self_deaf=True)
             elif state.voice_client.channel.id != voice_channel.id:
                 await state.voice_client.move_to(voice_channel)
+
+            # Max out the Opus encoder bitrate for best VC audio quality
+            if state.voice_client and hasattr(state.voice_client, 'encoder'):
+                try:
+                    state.voice_client.encoder.set_bitrate(MAX_ENCODER_BITRATE)
+                    logger.debug("Set VC encoder bitrate to %d bps", MAX_ENCODER_BITRATE)
+                except Exception as exc:
+                    logger.debug("Could not set encoder bitrate: %s", exc)
         except Exception as exc:
             logger.error("VC connection error: %s", exc, exc_info=True)
             embed = Embedder.error("Connection Error", "\u274c Could not join the voice channel.")
