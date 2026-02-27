@@ -5,7 +5,7 @@ Commands:
     /music   — Search & download a song with quality selection
     /play    — Search & play in voice channel
     /skip    — Skip current song
-    /stop    — Stop playback & leave VC
+    /music-stop — Stop playback & leave VC
     /queue   — Show the current queue
     /nowplaying — Show current song info
     /pause   — Pause playback
@@ -26,6 +26,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from config.constants import BOT_COLOR, BOT_ERROR_COLOR, BOT_INFO_COLOR, BOT_WARN_COLOR
 from utils.embedder import Embedder
 from utils.music_api import (
     DOWNLOAD_QUALITIES,
@@ -41,15 +42,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# ── Colours ──────────────────────────────────────────────────────────
-MUSIC_COLOR = 0x1DB954
-ERROR_COLOR = 0xFF0000
-INFO_COLOR = 0x3498DB
+# ── Colours (consistent with bot theme via constants) ─────────────────
+MUSIC_COLOR = BOT_COLOR
+ERROR_COLOR = BOT_ERROR_COLOR
+INFO_COLOR = BOT_INFO_COLOR
 
 # ── Discord limits ───────────────────────────────────────────────────
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 MAX_EMBED_DESC = 4096
 MAX_SELECT_OPTIONS = 25
+MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
 
 # ── Timeouts ─────────────────────────────────────────────────────────
 VIEW_TIMEOUT = 60  # seconds for interactive views
@@ -99,6 +101,30 @@ class GuildMusicState:
         if self.idle_task and not self.idle_task.done():
             self.idle_task.cancel()
             self.idle_task = None
+
+
+# =====================================================================
+#  Rate-limit helper
+# =====================================================================
+
+async def _check_rate_limit(
+    bot: Any, interaction: discord.Interaction, *, expensive: bool = False
+) -> bool:
+    """
+    Check rate limits following the project convention.
+    Returns True if allowed, False (and sends error) if rate-limited.
+    """
+    if not hasattr(bot, "rate_limiter"):
+        return True
+    result = bot.rate_limiter.check(
+        interaction.user.id, interaction.guild_id, expensive=expensive
+    )
+    if not result.allowed:
+        await interaction.response.send_message(
+            embed=Embedder.rate_limited(result.retry_after), ephemeral=True
+        )
+        return False
+    return True
 
 
 # =====================================================================
@@ -257,17 +283,33 @@ class QualitySelectView(discord.ui.View):
 
 
 class NowPlayingView(discord.ui.View):
-    """Buttons shown on the Now Playing embed."""
+    """Buttons shown on the Now Playing embed with staleness checks."""
 
-    def __init__(self, song: Dict[str, Any], cog: "MusicCog") -> None:
-        super().__init__(timeout=None)  # Persistent until song ends
+    def __init__(self, song: Dict[str, Any], cog: "MusicCog", guild_id: int) -> None:
+        # Timeout after the song duration + 60s buffer, minimum 120s
+        duration = song.get("duration", 0) or 300
+        timeout = max(duration + 60, 120)
+        super().__init__(timeout=timeout)
         self.song = song
         self.cog = cog
+        self.guild_id = guild_id
+
+    def _is_stale(self) -> bool:
+        """Check if this view's song is no longer current."""
+        state = self.cog._get_state(self.guild_id)
+        if not state.voice_client or not state.voice_client.is_connected():
+            return True
+        if state.current is None or state.current.get("id") != self.song.get("id"):
+            return True
+        return False
 
     @discord.ui.button(label="Skip", style=discord.ButtonStyle.secondary, emoji="\u23ed")
     async def skip_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild_id
         if not guild_id:
+            return
+        if self._is_stale():
+            await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
             return
         state = self.cog._get_state(guild_id)
         if state.voice_client and state.voice_client.is_playing():
@@ -281,6 +323,9 @@ class NowPlayingView(discord.ui.View):
         guild_id = interaction.guild_id
         if not guild_id:
             return
+        if self._is_stale():
+            await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
+            return
         state = self.cog._get_state(guild_id)
         if state.voice_client and state.voice_client.is_playing():
             state.voice_client.pause()
@@ -293,6 +338,9 @@ class NowPlayingView(discord.ui.View):
         guild_id = interaction.guild_id
         if not guild_id:
             return
+        if self._is_stale():
+            await interaction.response.send_message("No active playback to stop.", ephemeral=True)
+            return
         await self.cog._stop_and_leave(guild_id)
         await interaction.response.send_message("\u23f9 Stopped and left the channel.", ephemeral=True)
 
@@ -301,9 +349,14 @@ class NowPlayingView(discord.ui.View):
         query = f"{self.song['artist']} {self.song['name']}"
         await self.cog._send_lyrics(interaction, query, self.song["artist"], self.song["name"])
 
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, (discord.ui.Select, discord.ui.Button)):
+                item.disabled = True  # type: ignore[union-attr]
+
 
 # =====================================================================
-#  Embed builders
+#  Embed builders (using Embedder utility for consistency)
 # =====================================================================
 
 def _search_results_embed(
@@ -317,15 +370,12 @@ def _search_results_embed(
             f"{s['duration_formatted']} \u2022 {s['year']}"
         )
 
-    embed = discord.Embed(
-        title=f"\U0001f3b5 Results for \u201c{query}\u201d",
-        description="\n".join(lines)[:MAX_EMBED_DESC],
-        color=MUSIC_COLOR,
+    return Embedder.standard(
+        f"\U0001f3b5 Results for \u201c{query}\u201d",
+        "\n".join(lines)[:MAX_EMBED_DESC],
+        footer=f"Select a song \u2022 Expires in {VIEW_TIMEOUT}s \u2022 {BRAND}",
+        thumbnail=songs[0]["image"] if songs and songs[0].get("image") else None,
     )
-    if songs and songs[0].get("image"):
-        embed.set_thumbnail(url=songs[0]["image"])
-    embed.set_footer(text=f"Select a song \u2022 Expires in {VIEW_TIMEOUT}s \u2022 {BRAND}")
-    return embed
 
 
 def _song_detail_embed(song: Dict[str, Any]) -> discord.Embed:
@@ -335,15 +385,12 @@ def _song_detail_embed(song: Dict[str, Any]) -> discord.Embed:
         f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
         f"\u23f1 {song['duration_formatted']}"
     )
-    embed = discord.Embed(
-        title=f"\U0001f3b5 {song['name']}",
-        description=desc,
-        color=MUSIC_COLOR,
+    return Embedder.standard(
+        f"\U0001f3b5 {song['name']}",
+        desc,
+        footer=BRAND,
+        thumbnail=song.get("image"),
     )
-    if song.get("image"):
-        embed.set_thumbnail(url=song["image"])
-    embed.set_footer(text=BRAND)
-    return embed
 
 
 def _now_playing_embed(
@@ -356,19 +403,16 @@ def _now_playing_embed(
         f"\U0001f4bf {song['album']} \u2022 {song['year']}\n"
         f"\u23f1 {song['duration_formatted']}"
     )
-    embed = discord.Embed(
-        title="\U0001f3b5 Now Playing",
-        description=desc,
-        color=MUSIC_COLOR,
-    )
-    if song.get("image"):
-        embed.set_thumbnail(url=song["image"])
     footer_parts = ["320kbps"]
     if requester:
         footer_parts.append(f"Requested by @{requester.display_name}")
     footer_parts.append(BRAND)
-    embed.set_footer(text=" \u2022 ".join(footer_parts))
-    return embed
+    return Embedder.standard(
+        "\U0001f3b5 Now Playing",
+        desc,
+        footer=" \u2022 ".join(footer_parts),
+        thumbnail=song.get("image"),
+    )
 
 
 def _download_embed(
@@ -381,15 +425,12 @@ def _download_embed(
         f"\u23f1 {song['duration_formatted']}\n"
         f"\U0001f4ca {quality} \u2022 {size_mb:.1f} MB"
     )
-    embed = discord.Embed(
-        title=f"\U0001f4e5 {song['name']}",
-        description=desc,
-        color=MUSIC_COLOR,
+    return Embedder.standard(
+        f"\U0001f4e5 {song['name']}",
+        desc,
+        footer=BRAND,
+        thumbnail=song.get("image"),
     )
-    if song.get("image"):
-        embed.set_thumbnail(url=song["image"])
-    embed.set_footer(text=BRAND)
-    return embed
 
 
 def _queue_embed(state: GuildMusicState) -> discord.Embed:
@@ -405,14 +446,46 @@ def _queue_embed(state: GuildMusicState) -> discord.Embed:
     elif not state.current:
         lines.append("The queue is empty.")
 
-    embed = discord.Embed(
-        title="\U0001f4cb Music Queue",
-        description="\n".join(lines)[:MAX_EMBED_DESC],
-        color=MUSIC_COLOR,
-    )
     total = len(state.queue) + (1 if state.current else 0)
-    embed.set_footer(text=f"{total} song{'s' if total != 1 else ''} in queue \u2022 {BRAND}")
-    return embed
+    return Embedder.standard(
+        "\U0001f4cb Music Queue",
+        "\n".join(lines)[:MAX_EMBED_DESC],
+        footer=f"{total} song{'s' if total != 1 else ''} in queue \u2022 {BRAND}",
+    )
+
+
+# =====================================================================
+#  Helpers
+# =====================================================================
+
+def _sanitise_filename(artist: str, name: str) -> str:
+    """Build a safe, length-limited filename for downloads."""
+    safe_artist = "".join(c for c in artist if c.isalnum() or c in " -_").strip()
+    safe_name = "".join(c for c in name if c.isalnum() or c in " -_").strip()
+    base = f"{safe_artist} - {safe_name}"
+    # Truncate to MAX_FILENAME_LEN (leaving room for .mp3)
+    if len(base) > MAX_FILENAME_LEN - 4:
+        base = base[: MAX_FILENAME_LEN - 4].rstrip()
+    return f"{base}.mp3"
+
+
+def _split_text(text: str, max_len: int = 4000) -> List[str]:
+    """Split text into chunks respecting line boundaries."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: List[str] = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Find last newline within limit
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
 
 
 # =====================================================================
@@ -440,7 +513,6 @@ class MusicCog(commands.Cog, name="Music"):
 
     async def cog_unload(self) -> None:
         """Clean up all VC connections and close the HTTP session."""
-        # Disconnect all voice clients
         for guild_id, state in list(self._states.items()):
             try:
                 await self._stop_and_leave(guild_id)
@@ -475,6 +547,9 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.describe(query="Song name, artist, or Spotify/Deezer/Apple Music URL")
     async def music_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and present download/play options."""
+        if not await _check_rate_limit(self.bot, interaction, expensive=True):
+            return
+
         await interaction.response.defer()
 
         search_query = await self._resolve_query(query)
@@ -496,7 +571,9 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.describe(query="Song name, artist, or Spotify/Deezer/Apple Music URL")
     async def play_cmd(self, interaction: discord.Interaction, query: str) -> None:
         """Search for a song and play it in the user's voice channel."""
-        # Verify user is in a voice channel
+        if not await _check_rate_limit(self.bot, interaction, expensive=True):
+            return
+
         if not interaction.guild:
             await interaction.response.send_message(
                 embed=Embedder.error("Server Only", "This command can only be used in a server."),
@@ -523,7 +600,6 @@ class MusicCog(commands.Cog, name="Music"):
             )
             return
 
-        # If only one result or exact match, play directly
         if len(songs) == 1:
             song = await self.music_api.ensure_download_urls(songs[0])
             await self._play_song_in_vc(interaction, song, followup=True)
@@ -541,13 +617,10 @@ class MusicCog(commands.Cog, name="Music"):
             return
         state = self._get_state(interaction.guild_id)
         if state.voice_client and state.voice_client.is_playing():
-            state.voice_client.stop()  # Triggers the after callback → play_next
+            skipped_name = state.current["name"] if state.current else "current song"
+            state.voice_client.stop()  # Triggers the after callback -> play_next
             await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="\u23ed Skipped",
-                    description=f"Skipped **{state.current['name']}**" if state.current else "Skipped.",
-                    color=MUSIC_COLOR,
-                )
+                embed=Embedder.success("Skipped", f"\u23ed Skipped **{skipped_name}**")
             )
         else:
             await interaction.response.send_message(
@@ -566,11 +639,7 @@ class MusicCog(commands.Cog, name="Music"):
         if state.voice_client:
             await self._stop_and_leave(interaction.guild_id)
             await interaction.response.send_message(
-                embed=discord.Embed(
-                    title="\u23f9 Stopped",
-                    description="Music stopped and left the voice channel.",
-                    color=MUSIC_COLOR,
-                )
+                embed=Embedder.info("Stopped", "\u23f9 Music stopped and left the voice channel.")
             )
         else:
             await interaction.response.send_message(
@@ -600,7 +669,7 @@ class MusicCog(commands.Cog, name="Music"):
             requester_id = state.requester_map.get(state.current["id"])
             requester = self.bot.get_user(requester_id) if requester_id else None
             embed = _now_playing_embed(state.current, requester)
-            view = NowPlayingView(state.current, self)
+            view = NowPlayingView(state.current, self, interaction.guild_id)
             await interaction.response.send_message(embed=embed, view=view)
         else:
             await interaction.response.send_message(
@@ -619,7 +688,7 @@ class MusicCog(commands.Cog, name="Music"):
         if state.voice_client and state.voice_client.is_playing():
             state.voice_client.pause()
             await interaction.response.send_message(
-                embed=discord.Embed(title="\u23f8 Paused", color=MUSIC_COLOR)
+                embed=Embedder.info("Paused", "\u23f8 Playback paused.")
             )
         else:
             await interaction.response.send_message(
@@ -638,7 +707,7 @@ class MusicCog(commands.Cog, name="Music"):
         if state.voice_client and state.voice_client.is_paused():
             state.voice_client.resume()
             await interaction.response.send_message(
-                embed=discord.Embed(title="\u25b6 Resumed", color=MUSIC_COLOR)
+                embed=Embedder.success("Resumed", "\u25b6 Playback resumed.")
             )
         else:
             await interaction.response.send_message(
@@ -660,15 +729,11 @@ class MusicCog(commands.Cog, name="Music"):
         state.volume = level / 100.0
 
         if state.voice_client and state.voice_client.source:
-            # PCMVolumeTransformer supports .volume
             if hasattr(state.voice_client.source, "volume"):
                 state.voice_client.source.volume = state.volume  # type: ignore[attr-defined]
 
         await interaction.response.send_message(
-            embed=discord.Embed(
-                title=f"\U0001f50a Volume: {level}%",
-                color=MUSIC_COLOR,
-            )
+            embed=Embedder.info("Volume", f"\U0001f50a Volume set to **{level}%**")
         )
 
     # ── /lyrics ───────────────────────────────────────────────────────
@@ -676,6 +741,8 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.command(name="lyrics", description="Search for song lyrics")
     @app_commands.describe(query="Song name and/or artist")
     async def lyrics_cmd(self, interaction: discord.Interaction, query: str) -> None:
+        if not await _check_rate_limit(self.bot, interaction):
+            return
         await self._send_lyrics(interaction, query)
 
     # ── Internal: send lyrics ─────────────────────────────────────────
@@ -688,7 +755,6 @@ class MusicCog(commands.Cog, name="Music"):
         title: str = "",
     ) -> None:
         """Search for lyrics and send them as embeds."""
-        # Defer appropriately
         try:
             if not interaction.response.is_done():
                 await interaction.response.defer()
@@ -706,12 +772,10 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         if result.get("instrumental"):
-            embed = discord.Embed(
-                title=f"\U0001f3b5 {result.get('track', query)}",
-                description="\U0001f3b5 This is an instrumental track \u2014 no lyrics available.",
-                color=MUSIC_COLOR,
+            embed = Embedder.info(
+                f"\U0001f3b5 {result.get('track', query)}",
+                "\U0001f3b5 This is an instrumental track \u2014 no lyrics available.",
             )
-            embed.set_footer(text=BRAND)
             try:
                 await interaction.followup.send(embed=embed)
             except Exception:
@@ -722,20 +786,17 @@ class MusicCog(commands.Cog, name="Music"):
         track_name = result.get("track", query)
         artist_name = result.get("artist", "")
 
-        # Split lyrics into chunks if too long for a single embed
         header = f"\U0001f3a4 {artist_name}" if artist_name else ""
         chunks = _split_text(lyrics_text, MAX_EMBED_DESC - len(header) - 10)
 
         embeds: List[discord.Embed] = []
         for i, chunk in enumerate(chunks):
             desc = f"{header}\n\n{chunk}" if i == 0 and header else chunk
-            embed = discord.Embed(
-                title=f"\U0001f4dd {track_name}" if i == 0 else f"\U0001f4dd {track_name} (cont.)",
-                description=desc[:MAX_EMBED_DESC],
-                color=MUSIC_COLOR,
+            embed = Embedder.standard(
+                f"\U0001f4dd {track_name}" if i == 0 else f"\U0001f4dd {track_name} (cont.)",
+                desc[:MAX_EMBED_DESC],
+                footer=f"Source: {result.get('source', 'Unknown')} \u2022 {BRAND}" if i == len(chunks) - 1 else BRAND,
             )
-            if i == len(chunks) - 1:
-                embed.set_footer(text=f"Source: {result.get('source', 'Unknown')} \u2022 {BRAND}")
             embeds.append(embed)
 
         try:
@@ -752,7 +813,11 @@ class MusicCog(commands.Cog, name="Music"):
         song: Dict[str, Any],
         quality: str,
     ) -> None:
-        """Download a song at the given quality and send it as a file."""
+        """Download a song at the given quality and send it as a file.
+
+        Streams the download in chunks and checks size during transfer to
+        avoid loading excessively large files entirely into memory.
+        """
         try:
             if not interaction.response.is_done():
                 await interaction.response.defer()
@@ -782,28 +847,52 @@ class MusicCog(commands.Cog, name="Music"):
                     )
                     return
 
-                data = await resp.read()
+                # Check Content-Length header first if available
+                content_length = resp.headers.get("Content-Length")
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length)
+                    except (TypeError, ValueError):
+                        declared_size = None
+                    else:
+                        if declared_size > MAX_FILE_SIZE:
+                            size_mb = declared_size / (1024 * 1024)
+                            await interaction.followup.send(
+                                embed=Embedder.warning(
+                                    "File Too Large",
+                                    f"\u26a0\ufe0f File is {size_mb:.1f} MB, exceeding the 25 MB limit.\n"
+                                    f"Try a lower quality.",
+                                ),
+                                ephemeral=True,
+                            )
+                            return
 
-            size_bytes = len(data)
+                # Stream download in chunks with size enforcement
+                buffer = io.BytesIO()
+                downloaded = 0
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > MAX_FILE_SIZE:
+                        size_mb = downloaded / (1024 * 1024)
+                        await interaction.followup.send(
+                            embed=Embedder.warning(
+                                "File Too Large",
+                                f"\u26a0\ufe0f File exceeds the 25 MB limit.\nTry a lower quality.",
+                            ),
+                            ephemeral=True,
+                        )
+                        return
+                    buffer.write(chunk)
+
+            size_bytes = downloaded
             size_mb = size_bytes / (1024 * 1024)
 
-            if size_bytes > MAX_FILE_SIZE:
-                await interaction.followup.send(
-                    embed=Embedder.warning(
-                        "File Too Large",
-                        f"\u26a0\ufe0f File is {size_mb:.1f} MB, exceeding the 25 MB limit.\n"
-                        f"Try a lower quality.",
-                    ),
-                    ephemeral=True,
-                )
-                return
+            filename = _sanitise_filename(song["artist"], song["name"])
 
-            # Build filename
-            safe_artist = "".join(c for c in song["artist"] if c.isalnum() or c in " -_").strip()
-            safe_name = "".join(c for c in song["name"] if c.isalnum() or c in " -_").strip()
-            filename = f"{safe_artist} - {safe_name}.mp3"
-
-            file = discord.File(io.BytesIO(data), filename=filename)
+            buffer.seek(0)
+            file = discord.File(buffer, filename=filename)
             embed = _download_embed(song, quality, size_mb)
 
             await interaction.followup.send(embed=embed, file=file)
@@ -918,12 +1007,11 @@ class MusicCog(commands.Cog, name="Music"):
         if state.voice_client.is_playing() or state.voice_client.is_paused():
             state.queue.append(song)
             pos = len(state.queue)
-            embed = discord.Embed(
-                title="\U0001f3b5 Added to Queue",
-                description=f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
-                color=MUSIC_COLOR,
+            embed = Embedder.standard(
+                "\U0001f3b5 Added to Queue",
+                f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
+                footer=BRAND,
             )
-            embed.set_footer(text=BRAND)
             if followup:
                 await interaction.followup.send(embed=embed)
             else:
@@ -942,7 +1030,7 @@ class MusicCog(commands.Cog, name="Music"):
 
         requester = self.bot.get_user(interaction.user.id)
         embed = _now_playing_embed(song, requester)
-        view = NowPlayingView(song, self)
+        view = NowPlayingView(song, self, guild_id)
 
         if followup:
             await interaction.followup.send(embed=embed, view=view)
@@ -991,13 +1079,12 @@ class MusicCog(commands.Cog, name="Music"):
             stream_url = _pick_best_url(next_song.get("download_urls", []), "320kbps")
             if stream_url:
                 await self._start_playback(guild_id, stream_url)
-                # Send now playing in text channel
                 if state.text_channel:
                     try:
                         requester_id = state.requester_map.get(next_song["id"])
                         requester = self.bot.get_user(requester_id) if requester_id else None
                         embed = _now_playing_embed(next_song, requester)
-                        view = NowPlayingView(next_song, self)
+                        view = NowPlayingView(next_song, self, guild_id)
                         await state.text_channel.send(embed=embed, view=view)
                     except Exception:
                         pass
@@ -1006,7 +1093,6 @@ class MusicCog(commands.Cog, name="Music"):
                 await self._play_next(guild_id)  # Try next song
         else:
             state.current = None
-            # Start idle timer
             state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
 
     # ── Internal: idle disconnect ─────────────────────────────────────
@@ -1020,12 +1106,10 @@ class MusicCog(commands.Cog, name="Music"):
                 if not state.voice_client.is_playing() and not state.voice_client.is_paused():
                     if state.text_channel:
                         try:
-                            embed = discord.Embed(
-                                title="\U0001f44b Disconnected",
-                                description="Left the voice channel due to inactivity.",
-                                color=INFO_COLOR,
+                            embed = Embedder.info(
+                                "\U0001f44b Disconnected",
+                                "Left the voice channel due to inactivity.",
                             )
-                            embed.set_footer(text=BRAND)
                             await state.text_channel.send(embed=embed)
                         except Exception:
                             pass
@@ -1071,37 +1155,12 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         vc_channel = state.voice_client.channel
-        # Count non-bot members
         humans = sum(1 for m in vc_channel.members if not m.bot)
 
         if humans == 0:
-            # Start an idle task to disconnect
             if state.idle_task and not state.idle_task.done():
                 state.idle_task.cancel()
             state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
-
-
-# =====================================================================
-#  Helpers
-# =====================================================================
-
-def _split_text(text: str, max_len: int = 4000) -> List[str]:
-    """Split text into chunks respecting line boundaries."""
-    if len(text) <= max_len:
-        return [text]
-
-    chunks: List[str] = []
-    while text:
-        if len(text) <= max_len:
-            chunks.append(text)
-            break
-        # Find last newline within limit
-        split_at = text.rfind("\n", 0, max_len)
-        if split_at == -1:
-            split_at = max_len
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
-    return chunks
 
 
 # =====================================================================

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Optional
-from urllib.parse import urlparse, unquote
+from urllib.parse import quote, unquote
 
 import aiohttp
 
@@ -51,7 +51,7 @@ async def resolve_url(url: str, session: aiohttp.ClientSession) -> Optional[str]
 
     Supports:
     - Spotify track URLs (via oEmbed)
-    - Deezer track URLs (via oEmbed)
+    - Deezer track URLs (via Deezer public API)
     - Apple Music URLs (extracted from URL path)
 
     Returns
@@ -87,7 +87,8 @@ async def resolve_url(url: str, session: aiohttp.ClientSession) -> Optional[str]
 async def _resolve_spotify(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """Resolve a Spotify track URL via the oEmbed endpoint."""
     try:
-        oembed_url = f"https://open.spotify.com/oembed?url={url}"
+        encoded_url = quote(url, safe="")
+        oembed_url = f"https://open.spotify.com/oembed?url={encoded_url}"
         async with session.get(
             oembed_url,
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),

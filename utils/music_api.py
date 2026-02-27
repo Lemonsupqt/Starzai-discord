@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # ── Internal API endpoints (NEVER expose to users) ──────────────────
 MUSIC_APIS: List[str] = [
-    "https://jiosavan-api2.vercel.app",
+    "https://jiosaavn-api2.vercel.app",
     "https://jiosaavn-api-privatecvc2.vercel.app",
     "https://saavn.dev/api",
     "https://jiosaavn-api.vercel.app",

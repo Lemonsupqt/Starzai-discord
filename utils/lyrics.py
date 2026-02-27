@@ -49,24 +49,28 @@ class LyricsFetcher:
                 if not isinstance(data, list):
                     return None
 
-                # Pick the first result that has actual lyrics
+                # Two-pass scan: first try to find a result with actual lyrics,
+                # then fall back to instrumental if that's all that's available.
+                instrumental_fallback: Optional[Dict[str, Any]] = None
+
                 for entry in data:
                     if not isinstance(entry, dict):
                         continue
 
-                    # Skip instrumentals unless nothing else is found
                     if entry.get("instrumental"):
-                        # Return it tagged so the caller can show the message
-                        return {
-                            "track": entry.get("trackName", ""),
-                            "artist": entry.get("artistName", ""),
-                            "album": entry.get("albumName", ""),
-                            "duration": entry.get("duration", 0),
-                            "lyrics": None,
-                            "synced_lyrics": None,
-                            "instrumental": True,
-                            "source": "LRCLIB",
-                        }
+                        # Remember the first instrumental, but keep looking for lyrics
+                        if instrumental_fallback is None:
+                            instrumental_fallback = {
+                                "track": entry.get("trackName", ""),
+                                "artist": entry.get("artistName", ""),
+                                "album": entry.get("albumName", ""),
+                                "duration": entry.get("duration", 0),
+                                "lyrics": None,
+                                "synced_lyrics": None,
+                                "instrumental": True,
+                                "source": "LRCLIB",
+                            }
+                        continue
 
                     plain = entry.get("plainLyrics")
                     if plain and plain.strip():
@@ -80,6 +84,10 @@ class LyricsFetcher:
                             "instrumental": False,
                             "source": "LRCLIB",
                         }
+
+                # No lyrics found — return the instrumental result if we had one
+                if instrumental_fallback is not None:
+                    return instrumental_fallback
 
         except asyncio.TimeoutError:
             logger.warning("LRCLIB timed out for query '%s'", query)
