@@ -116,6 +116,9 @@ async def _check_rate_limit(
     """
     Check rate limits following the project convention.
     Returns True if allowed, False (and sends error) if rate-limited.
+
+    Safe to call whether the interaction has been deferred or not;
+    uses ``followup.send`` when the response is already consumed.
     """
     if not hasattr(bot, "rate_limiter"):
         return True
@@ -123,9 +126,14 @@ async def _check_rate_limit(
         interaction.user.id, interaction.guild_id, expensive=expensive
     )
     if not result.allowed:
-        await interaction.response.send_message(
-            embed=Embedder.rate_limited(result.retry_after), ephemeral=True
-        )
+        embed = Embedder.rate_limited(result.retry_after)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+        except discord.NotFound:
+            pass  # Interaction expired
         return False
     return True
 
@@ -176,12 +184,13 @@ class SongSelectView(discord.ui.View):
             )
             return
 
-        # Rate-limit UI callbacks to prevent abuse
+        # Defer FIRST — network work below can exceed Discord's 3s deadline.
+        # Rate-limit check happens after deferral so we never leave the
+        # interaction unacknowledged (which causes "Unknown interaction").
+        await interaction.response.defer()
+
         if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
             return
-
-        # Defer early — network work below can exceed Discord's 3s deadline
-        await interaction.response.defer()
 
         idx = int(interaction.data["values"][0])  # type: ignore[index]
         song = self.songs[idx]
@@ -258,7 +267,9 @@ class QualitySelectView(discord.ui.View):
                     "\u274c These buttons aren\u2019t for you!", ephemeral=True
                 )
                 return
-            # Rate-limit download button clicks to prevent abuse
+            # Defer FIRST to prevent "Unknown interaction" errors,
+            # then check rate limit via followup.
+            await interaction.response.defer()
             if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
                 return
             await self.cog._download_song(interaction, self.song, quality)
@@ -271,10 +282,12 @@ class QualitySelectView(discord.ui.View):
                 "\u274c These buttons aren\u2019t for you!", ephemeral=True
             )
             return
-        # Rate-limit play button clicks to prevent abuse
+        # Defer FIRST to prevent "Unknown interaction" errors,
+        # then check rate limit via followup.
+        await interaction.response.defer()
         if not await _check_rate_limit(self.cog.bot, interaction, expensive=True):
             return
-        await self.cog._play_song_in_vc(interaction, self.song)
+        await self.cog._play_song_in_vc(interaction, self.song, followup=True)
 
     async def _on_lyrics(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.original_interaction.user.id:
@@ -323,41 +336,50 @@ class NowPlayingView(discord.ui.View):
         guild_id = interaction.guild_id
         if not guild_id:
             return
-        if self._is_stale():
-            await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
-            return
-        state = self.cog._get_state(guild_id)
-        if state.voice_client and state.voice_client.is_playing():
-            state.voice_client.stop()
-            await interaction.response.send_message("\u23ed Skipped!", ephemeral=True)
-        else:
-            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        try:
+            if self._is_stale():
+                await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
+                return
+            state = self.cog._get_state(guild_id)
+            if state.voice_client and state.voice_client.is_playing():
+                state.voice_client.stop()
+                await interaction.response.send_message("\u23ed Skipped!", ephemeral=True)
+            else:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        except discord.NotFound:
+            pass  # Interaction expired
 
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="\u23f8")
     async def pause_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild_id
         if not guild_id:
             return
-        if self._is_stale():
-            await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
-            return
-        state = self.cog._get_state(guild_id)
-        if state.voice_client and state.voice_client.is_playing():
-            state.voice_client.pause()
-            await interaction.response.send_message("\u23f8 Paused.", ephemeral=True)
-        else:
-            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        try:
+            if self._is_stale():
+                await interaction.response.send_message("This song is no longer playing.", ephemeral=True)
+                return
+            state = self.cog._get_state(guild_id)
+            if state.voice_client and state.voice_client.is_playing():
+                state.voice_client.pause()
+                await interaction.response.send_message("\u23f8 Paused.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+        except discord.NotFound:
+            pass  # Interaction expired
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, emoji="\u23f9")
     async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         guild_id = interaction.guild_id
         if not guild_id:
             return
-        if self._is_stale():
-            await interaction.response.send_message("No active playback to stop.", ephemeral=True)
-            return
-        await self.cog._stop_and_leave(guild_id)
-        await interaction.response.send_message("\u23f9 Stopped and left the channel.", ephemeral=True)
+        try:
+            if self._is_stale():
+                await interaction.response.send_message("No active playback to stop.", ephemeral=True)
+                return
+            await self.cog._stop_and_leave(guild_id)
+            await interaction.response.send_message("\u23f9 Stopped and left the channel.", ephemeral=True)
+        except discord.NotFound:
+            pass  # Interaction expired
 
     @discord.ui.button(label="\U0001f4dd Lyrics", style=discord.ButtonStyle.secondary)
     async def lyrics_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
