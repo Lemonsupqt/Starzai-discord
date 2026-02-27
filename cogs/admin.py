@@ -329,6 +329,29 @@ class AdminCog(commands.Cog, name="Admin"):
         )
         
         embed.add_field(
+            name="\U0001f3b5 Music & VC",
+            value=(
+                "`/music` - Search and download a song (MP3)\n"
+                "`/play` - Play a song in your voice channel\n"
+                "`/playnext` - Add a song to the front of the queue\n"
+                "`/queue` - View the music queue (paginated)\n"
+                "`/nowplaying` - Show current song with progress bar\n"
+                "`/skip` - Skip the current song\n"
+                "`/pause` / `/resume` - Pause or resume playback\n"
+                "`/shuffle` - Shuffle the queue\n"
+                "`/loop` - Set loop mode (off / track / queue)\n"
+                "`/seek` - Jump to a position in the song\n"
+                "`/remove` - Remove a song from queue by position\n"
+                "`/clear` - Clear the entire queue\n"
+                "`/volume` - Set playback volume (0-100)\n"
+                "`/lyrics` - Search for song lyrics\n"
+                "`/djrole` - Set a DJ role for queue management\n"
+                "`/music-stop` - Stop playback and leave VC"
+            ),
+            inline=False,
+        )
+        
+        embed.add_field(
             name="🎮 Games & Fun",
             value=(
                 "`/trivia` - Play trivia with different categories\n"
@@ -361,11 +384,15 @@ class AdminCog(commands.Cog, name="Admin"):
             name="💡 Features",
             value=(
                 "✅ **Multi-turn Conversations** - Context-aware AI chat\n"
+                "✅ **Music Player** - VC playback with progress bar, loop, shuffle, seek\n"
+                "✅ **MP3 Downloads** - High-quality single-file downloads\n"
+                "✅ **7 Music Platforms** - Spotify, YouTube, SoundCloud, Tidal & more\n"
+                "✅ **DJ Role System** - Control who manages the queue\n"
+                "✅ **Auto-Resume** - Resumes playback on reconnect\n"
                 "✅ **Personalization** - Remembers your preferences\n"
                 "✅ **Privacy-First** - GDPR compliant with data controls\n"
                 "✅ **Multiple AI Models** - Choose your preferred model\n"
-                "✅ **Real Astronomy** - Swiss Ephemeris calculations\n"
-                "✅ **30-Day Data Retention** - Automatic cleanup"
+                "✅ **Real Astronomy** - Swiss Ephemeris calculations"
             ),
             inline=False,
         )
