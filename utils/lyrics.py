@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import aiohttp
 
@@ -108,8 +109,8 @@ class LyricsFetcher:
             return None
 
         try:
-            # URL-encode artist and title via the params mechanism
-            url = f"{LYRICS_OVH_BASE}/{artist}/{title}"
+            # URL-encode artist and title for safe path segments
+            url = f"{LYRICS_OVH_BASE}/{quote(artist, safe='')}/{quote(title, safe='')}"
             async with self._session.get(
                 url,
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),

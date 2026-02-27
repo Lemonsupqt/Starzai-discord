@@ -180,7 +180,7 @@ def normalize_song(song: Dict[str, Any]) -> Dict[str, Any]:
         "name": _safe_unescape(song.get("name", "Unknown")),
         "artist": _extract_artist(song),
         "album": _safe_unescape(album_name),
-        "year": str(song.get("year", "")),
+        "year": str(song["year"]) if song.get("year") is not None else "",
         "duration": duration_sec,
         "duration_formatted": _format_duration(duration_sec),
         "language": song.get("language", ""),

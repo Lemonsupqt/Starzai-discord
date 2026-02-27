@@ -178,6 +178,28 @@ class TestLyricsFetcherOvh(unittest.IsolatedAsyncioTestCase):
         result = await fetcher._search_lyrics_ovh("A", "B")
         self.assertIsNone(result)
 
+    async def test_url_encodes_artist_and_title(self):
+        """Special characters in artist/title should be URL-encoded."""
+        data = {"lyrics": "Encoded lyrics"}
+        session = _FakeSession([_FakeResponse(200, data)])
+        # Track the URL called
+        called_urls = []
+        original_get = session.get
+
+        def tracking_get(url, **kwargs):
+            called_urls.append(url)
+            return original_get(url, **kwargs)
+
+        session.get = tracking_get
+        fetcher = LyricsFetcher(session)
+        result = await fetcher._search_lyrics_ovh("AC/DC", "Back In Black")
+
+        self.assertIsNotNone(result)
+        # Verify the URL was encoded (no raw slashes in artist name)
+        self.assertEqual(len(called_urls), 1)
+        self.assertIn("AC%2FDC", called_urls[0])
+        self.assertIn("Back%20In%20Black", called_urls[0])
+
 
 class TestLyricsFetcherSearch(unittest.IsolatedAsyncioTestCase):
     async def test_fallback_to_ovh_with_explicit_artist_title(self):

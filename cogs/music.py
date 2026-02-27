@@ -200,9 +200,8 @@ class SongSelectView(discord.ui.View):
             if isinstance(item, (discord.ui.Select, discord.ui.Button)):
                 item.disabled = True  # type: ignore[union-attr]
         try:
-            await self.original_interaction.edit_original_response(
-                content="\u23f0 Selection expired.", view=self
-            )
+            msg = self.message or await self.original_interaction.original_response()
+            await msg.edit(content="\u23f0 Selection expired.", view=self)
         except Exception:
             pass
 
@@ -1175,7 +1174,9 @@ class MusicCog(commands.Cog, name="Music"):
                 await self._play_next(guild_id)  # Try next song
         else:
             state.current = None
-            state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
+            # Only schedule idle disconnect if still connected to VC
+            if state.voice_client and state.voice_client.is_connected():
+                state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
 
     # ── Internal: idle disconnect ─────────────────────────────────────
 
@@ -1240,9 +1241,15 @@ class MusicCog(commands.Cog, name="Music"):
         humans = sum(1 for m in vc_channel.members if not m.bot)
 
         if humans == 0:
+            # All humans left — start idle disconnect timer
             if state.idle_task and not state.idle_task.done():
                 state.idle_task.cancel()
             state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
+        else:
+            # A human is present — cancel any pending idle disconnect
+            if state.idle_task and not state.idle_task.done():
+                state.idle_task.cancel()
+                state.idle_task = None
 
 
 # =====================================================================

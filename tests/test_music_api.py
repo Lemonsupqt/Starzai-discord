@@ -277,6 +277,16 @@ class TestNormalizeSong(unittest.TestCase):
         self.assertEqual(result["duration"], 0)
         self.assertEqual(result["best_url"], "")
 
+    def test_none_year_does_not_produce_none_string(self):
+        """year=None should become empty string, not 'None'."""
+        result = normalize_song({"year": None})
+        self.assertEqual(result["year"], "")
+
+    def test_missing_year_returns_empty(self):
+        """Missing year key should produce empty string."""
+        result = normalize_song({})
+        self.assertEqual(result["year"], "")
+
 
 class TestNormalizeSongs(unittest.TestCase):
     def test_filters_non_dicts(self):
