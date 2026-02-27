@@ -142,6 +142,8 @@ class GuildMusicState:
         "dj_role_id",
         # Auto-resume
         "_resume_info",
+        # Concurrency lock — serialises connect / play / queue mutations
+        "_lock",
     )
 
     def __init__(self) -> None:
@@ -165,6 +167,9 @@ class GuildMusicState:
         self.dj_role_id: Optional[int] = None
         # Auto-resume state
         self._resume_info: Optional[Dict[str, Any]] = None
+        # Per-guild lock — serialises VC connect / play / queue mutations
+        # so concurrent /play commands don't race and kill each other.
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     @property
     def current_position(self) -> float:
@@ -868,6 +873,66 @@ class MusicCog(commands.Cog, name="Music"):
             self._states[guild_id] = GuildMusicState()
         return self._states[guild_id]
 
+    # ── Safe VC connection helper ─────────────────────────────────────
+
+    async def _ensure_voice(
+        self,
+        guild: discord.Guild,
+        channel: discord.VoiceChannel,
+        state: GuildMusicState,
+    ) -> Optional[discord.VoiceClient]:
+        """Return a connected VoiceClient, reusing an existing one if possible.
+
+        This method is the **single place** that creates or re-syncs the
+        voice-client reference, which prevents the race where two concurrent
+        ``connect()`` calls kill each other's streams.
+
+        Must be called while holding ``state._lock``.
+        """
+        vc = state.voice_client
+
+        # 1. Re-sync: discord.py tracks the guild's VC independently.
+        #    If our local reference is stale, adopt the guild's client.
+        guild_vc = guild.voice_client
+        if guild_vc is not None and guild_vc.is_connected():
+            if vc is None or vc != guild_vc:
+                state.voice_client = guild_vc  # type: ignore[assignment]
+                vc = guild_vc
+
+        # 2. Already connected — just move if necessary.
+        if vc is not None and vc.is_connected():
+            if vc.channel.id != channel.id:
+                await vc.move_to(channel)
+            state.voice_client = vc  # type: ignore[assignment]
+            return vc  # type: ignore[return-value]
+
+        # 3. Not connected at all — clean up any dangling reference first
+        #    so that discord.py doesn't raise "Already connected".
+        if guild_vc is not None:
+            try:
+                await guild_vc.disconnect(force=True)
+            except Exception:
+                pass
+
+        # 4. Fresh connect.
+        vc = await channel.connect(self_deaf=True)
+        state.voice_client = vc
+        return vc
+
+    def _tune_encoder(self, vc: discord.VoiceClient) -> None:
+        """Max-out the Opus encoder knobs for best music quality."""
+        if not hasattr(vc, "encoder"):
+            return
+        try:
+            enc = vc.encoder
+            enc.set_bitrate(MAX_ENCODER_BITRATE)       # 512 kbps ceiling
+            enc.set_signal_type("music")                # optimise for music
+            enc.set_bandwidth("full")                   # full 20 kHz bandwidth
+            enc.set_fec(True)                           # forward error correction
+            enc.set_expected_packet_loss_percent(0.05)  # 5 %
+        except Exception as exc:
+            logger.debug("Could not tune encoder: %s", exc)
+
     # ── Service availability guard ─────────────────────────────────────
 
     def _services_ready(self) -> bool:
@@ -1289,16 +1354,17 @@ class MusicCog(commands.Cog, name="Music"):
 
         await interaction.response.defer()
 
-        # Stop current playback (mark as seeking so _play_next doesn't trigger)
-        state._seeking = True
-        if state.voice_client.is_playing() or state.voice_client.is_paused():
-            state.voice_client.stop()
+        async with state._lock:
+            # Stop current playback (mark as seeking so _play_next doesn't trigger)
+            state._seeking = True
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.voice_client.stop()
 
-        # Small delay to let the stop callback fire
-        await asyncio.sleep(0.3)
+            # Small delay to let the stop callback fire
+            await asyncio.sleep(0.3)
 
-        # Restart playback at the seeked position
-        await self._start_playback(interaction.guild_id, stream_url, seek_to=seek_seconds)
+            # Restart playback at the seeked position
+            await self._start_playback(interaction.guild_id, stream_url, seek_to=seek_seconds)
 
         await interaction.followup.send(
             embed=Embedder.success(
@@ -1407,19 +1473,25 @@ class MusicCog(commands.Cog, name="Music"):
         if song.get("id"):
             state.requester_map[song["id"]] = interaction.user.id
 
-        # If nothing is playing, just play it directly
-        if not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
-            await self._play_song_in_vc(interaction, song, followup=True)
-            return
+        # Use the lock to safely check playback state and mutate the queue
+        async with state._lock:
+            # If nothing is playing, just play it directly (release lock first)
+            if not state.voice_client or not (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                pass  # fall through — will call _play_song_in_vc below
+            else:
+                # Insert at the front of the queue
+                state.queue.insert(0, song)
+                await interaction.followup.send(
+                    embed=Embedder.success(
+                        "\u23cf\ufe0f Play Next",
+                        f"**{song['name']}** \u2014 {song['artist']} will play next!",
+                    )
+                )
+                return
 
-        # Insert at the front of the queue
-        state.queue.insert(0, song)
-        await interaction.followup.send(
-            embed=Embedder.success(
-                "\u23cf\ufe0f Play Next",
-                f"**{song['name']}** \u2014 {song['artist']} will play next!",
-            )
-        )
+        # Nothing playing — delegate to _play_song_in_vc which handles
+        # its own locking.
+        await self._play_song_in_vc(interaction, song, followup=True)
 
     # ── /djrole ──────────────────────────────────────────────────────
 
@@ -1825,6 +1897,26 @@ class MusicCog(commands.Cog, name="Music"):
                     except OSError:
                         pass
 
+    # ── Internal: send a response/followup safely ──────────────────────
+
+    async def _send(
+        self,
+        interaction: discord.Interaction,
+        *,
+        embed: discord.Embed,
+        view: Optional[discord.ui.View] = None,
+        ephemeral: bool = False,
+        followup: bool = False,
+    ) -> None:
+        """Send an embed via the most appropriate method (response / followup)."""
+        try:
+            if followup or interaction.response.is_done():
+                await interaction.followup.send(embed=embed, view=view, ephemeral=ephemeral)
+            else:
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=ephemeral)
+        except Exception:
+            pass
+
     # ── Internal: play song in VC ─────────────────────────────────────
 
     async def _play_song_in_vc(
@@ -1834,7 +1926,12 @@ class MusicCog(commands.Cog, name="Music"):
         *,
         followup: bool = False,
     ) -> None:
-        """Join VC (if needed) and play/queue the song."""
+        """Join VC (if needed) and play/queue the song.
+
+        All VC-mutation logic is serialised through ``state._lock`` so that
+        concurrent ``/play`` commands cannot race each other and kill an
+        active stream.
+        """
         # Defer early — VC connect + API calls can exceed Discord's 3s deadline
         try:
             if not interaction.response.is_done():
@@ -1845,164 +1942,98 @@ class MusicCog(commands.Cog, name="Music"):
 
         # Guard against session being closed (e.g. cog unloaded while UI active)
         if not self._services_ready():
-            msg = "\u274c Music services are not available right now. Please try again later."
-            try:
-                if followup:
-                    await interaction.followup.send(
-                        embed=Embedder.error("Service Unavailable", msg), ephemeral=True
-                    )
-                elif not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        embed=Embedder.error("Service Unavailable", msg), ephemeral=True
-                    )
-                else:
-                    await interaction.followup.send(
-                        embed=Embedder.error("Service Unavailable", msg), ephemeral=True
-                    )
-            except Exception:
-                pass
+            await self._send(
+                interaction,
+                embed=Embedder.error(
+                    "Service Unavailable",
+                    "\u274c Music services are not available right now. Please try again later.",
+                ),
+                ephemeral=True, followup=followup,
+            )
             return
 
         if not interaction.guild:
-            msg = "\u274c This command can only be used in a server."
-            if followup:
-                await interaction.followup.send(embed=Embedder.error("Error", msg), ephemeral=True)
-            else:
-                try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(
-                            embed=Embedder.error("Error", msg), ephemeral=True
-                        )
-                    else:
-                        await interaction.followup.send(embed=Embedder.error("Error", msg), ephemeral=True)
-                except Exception:
-                    pass
+            await self._send(
+                interaction,
+                embed=Embedder.error("Error", "\u274c This command can only be used in a server."),
+                ephemeral=True, followup=followup,
+            )
             return
 
         member = interaction.guild.get_member(interaction.user.id)
         if not member or not member.voice or not member.voice.channel:
-            msg = "\U0001f50a Join a voice channel first!"
-            if followup:
-                await interaction.followup.send(embed=Embedder.error("Not in VC", msg), ephemeral=True)
-            else:
-                try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(
-                            embed=Embedder.error("Not in VC", msg), ephemeral=True
-                        )
-                    else:
-                        await interaction.followup.send(embed=Embedder.error("Not in VC", msg), ephemeral=True)
-                except Exception:
-                    pass
+            await self._send(
+                interaction,
+                embed=Embedder.error("Not in VC", "\U0001f50a Join a voice channel first!"),
+                ephemeral=True, followup=followup,
+            )
             return
 
         voice_channel = member.voice.channel
         guild_id = interaction.guild.id
         state = self._get_state(guild_id)
 
-        # Ensure download URL exists
+        # Ensure download URL exists (HTTP work — done OUTSIDE the lock
+        # so we don't hold the lock during a slow network request).
         song = await self.music_api.ensure_download_urls(song)
         stream_url = _pick_best_url(song.get("download_urls", []), "320kbps")
         if not stream_url:
-            embed = Embedder.error("No Stream", "\u274c Could not find a stream URL for this song.")
-            if followup:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(embed=embed, ephemeral=True)
-                    else:
-                        await interaction.followup.send(embed=embed, ephemeral=True)
-                except Exception:
-                    pass
-            return
-
-        # Store requester (only when the song has a valid ID)
-        if song.get("id"):
-            state.requester_map[song["id"]] = interaction.user.id
-        state.text_channel = interaction.channel
-
-        # Connect to VC if not already
-        try:
-            if state.voice_client is None or not state.voice_client.is_connected():
-                state.voice_client = await voice_channel.connect(self_deaf=True)
-            elif state.voice_client.channel.id != voice_channel.id:
-                await state.voice_client.move_to(voice_channel)
-
-            # Max out every Opus encoder knob for the best music quality
-            if state.voice_client and hasattr(state.voice_client, 'encoder'):
-                try:
-                    enc = state.voice_client.encoder
-                    enc.set_bitrate(MAX_ENCODER_BITRATE)       # 512 kbps ceiling
-                    enc.set_signal_type('music')                # optimise for music (not voice)
-                    enc.set_bandwidth('full')                   # full 20 kHz bandwidth
-                    enc.set_fec(True)                           # forward error correction on
-                    enc.set_expected_packet_loss_percent(0.05)  # 5% — low, keeps quality high
-                    logger.debug(
-                        "Opus encoder tuned: %d bps, music signal, full BW, FEC on",
-                        MAX_ENCODER_BITRATE,
-                    )
-                except Exception as exc:
-                    logger.debug("Could not tune encoder: %s", exc)
-        except Exception as exc:
-            logger.error("VC connection error: %s", exc, exc_info=True)
-            embed = Embedder.error("Connection Error", "\u274c Could not join the voice channel.")
-            if followup:
-                await interaction.followup.send(embed=embed, ephemeral=True)
-            else:
-                try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(embed=embed, ephemeral=True)
-                    else:
-                        await interaction.followup.send(embed=embed, ephemeral=True)
-                except Exception:
-                    pass
-            return
-
-        # Cancel idle task if it exists
-        if state.idle_task and not state.idle_task.done():
-            state.idle_task.cancel()
-            state.idle_task = None
-
-        # If already playing, queue the song
-        if state.voice_client.is_playing() or state.voice_client.is_paused():
-            state.queue.append(song)
-            pos = len(state.queue)
-            embed = Embedder.standard(
-                "\U0001f3b5 Added to Queue",
-                f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
-                footer=BRAND,
+            await self._send(
+                interaction,
+                embed=Embedder.error("No Stream", "\u274c Could not find a stream URL for this song."),
+                ephemeral=True, followup=followup,
             )
-            if followup:
-                await interaction.followup.send(embed=embed)
-            else:
-                try:
-                    if not interaction.response.is_done():
-                        await interaction.response.send_message(embed=embed)
-                    else:
-                        await interaction.followup.send(embed=embed)
-                except Exception:
-                    pass
             return
 
-        # Play immediately
-        state.current = song
-        await self._start_playback(guild_id, stream_url)
+        # ── All VC / state mutation below is protected by the lock ────
+        async with state._lock:
+            # Store requester (only when the song has a valid ID)
+            if song.get("id"):
+                state.requester_map[song["id"]] = interaction.user.id
+            state.text_channel = interaction.channel
 
+            # Connect to VC using the safe helper
+            try:
+                vc = await self._ensure_voice(interaction.guild, voice_channel, state)
+                self._tune_encoder(vc)
+            except Exception as exc:
+                logger.error("VC connection error: %s", exc, exc_info=True)
+                await self._send(
+                    interaction,
+                    embed=Embedder.error("Connection Error", "\u274c Could not join the voice channel."),
+                    ephemeral=True, followup=followup,
+                )
+                return
+
+            # Cancel idle task if it exists
+            if state.idle_task and not state.idle_task.done():
+                state.idle_task.cancel()
+                state.idle_task = None
+
+            # If already playing, queue the song — do NOT touch playback
+            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                state.queue.append(song)
+                pos = len(state.queue)
+                await self._send(
+                    interaction,
+                    embed=Embedder.standard(
+                        "\U0001f3b5 Added to Queue",
+                        f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
+                        footer=BRAND,
+                    ),
+                    followup=followup,
+                )
+                return
+
+            # Nothing playing — start playback immediately
+            state.current = song
+            await self._start_playback(guild_id, stream_url)
+
+        # ── Lock released — safe to do slow Discord API work ──────────
         requester = self.bot.get_user(interaction.user.id)
         embed = _now_playing_embed(state, song, requester)
         view = NowPlayingView(song, self, guild_id)
-
-        if followup:
-            await interaction.followup.send(embed=embed, view=view)
-        else:
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(embed=embed, view=view)
-                else:
-                    await interaction.followup.send(embed=embed, view=view)
-            except Exception:
-                pass
+        await self._send(interaction, embed=embed, view=view, followup=followup)
 
     # ── Internal: start FFmpeg playback ───────────────────────────────
 
@@ -2052,7 +2083,11 @@ class MusicCog(commands.Cog, name="Music"):
     # ── Internal: play next in queue ──────────────────────────────────
 
     async def _play_next(self, guild_id: int, error: Optional[Exception] = None) -> None:
-        """Called when a song ends; plays the next in queue or starts idle timer."""
+        """Called when a song ends; plays the next in queue or starts idle timer.
+
+        Acquires ``state._lock`` to prevent races with concurrent ``/play``
+        commands that might also try to mutate the queue or start playback.
+        """
         if error:
             logger.error("Playback error in guild %d: %s", guild_id, error)
 
@@ -2063,46 +2098,59 @@ class MusicCog(commands.Cog, name="Music"):
             state._seeking = False
             return
 
-        # ── Loop mode: TRACK — replay the same song ──────────────
-        if state.loop_mode == "track" and state.current:
-            stream_url = state._current_stream_url or _pick_best_url(
-                state.current.get("download_urls", []), "320kbps"
-            )
-            if stream_url:
-                await self._start_playback(guild_id, stream_url)
+        text_ch = None
+        np_song: Optional[Dict[str, Any]] = None
+
+        async with state._lock:
+            # ── Loop mode: TRACK — replay the same song ──────────────
+            if state.loop_mode == "track" and state.current:
+                stream_url = state._current_stream_url or _pick_best_url(
+                    state.current.get("download_urls", []), "320kbps"
+                )
+                if stream_url:
+                    await self._start_playback(guild_id, stream_url)
+                    return
+
+            # ── Loop mode: QUEUE — append current to the end before advancing
+            if state.loop_mode == "queue" and state.current:
+                state.queue.append(state.current)
+
+            # Iterate through the queue until we find a playable track or the queue is empty.
+            while state.queue:
+                next_song = state.queue.pop(0)
+                state.current = next_song
+                stream_url = _pick_best_url(next_song.get("download_urls", []), "320kbps")
+                if stream_url:
+                    await self._start_playback(guild_id, stream_url)
+                    # Send the "Now Playing" embed outside the lock to avoid
+                    # holding it during slow Discord API calls.  Copy the
+                    # needed values first.
+                    text_ch = state.text_channel
+                    np_song = next_song
+
+                    # Release lock, then send message
+                    break
+                else:
+                    logger.warning("Skipping song '%s' — no stream URL", next_song.get("name", ""))
+                    state.current = None
+            else:
+                # Queue exhausted — nothing more to play.
+                state.current = None
+                state.playback_start_time = 0.0
+                if state.voice_client and state.voice_client.is_connected():
+                    state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
                 return
 
-        # ── Loop mode: QUEUE — append current to the end before advancing
-        if state.loop_mode == "queue" and state.current:
-            state.queue.append(state.current)
-
-        # Iterate through the queue until we find a playable track or the queue is empty.
-        while state.queue:
-            next_song = state.queue.pop(0)
-            state.current = next_song
-            stream_url = _pick_best_url(next_song.get("download_urls", []), "320kbps")
-            if stream_url:
-                await self._start_playback(guild_id, stream_url)
-                if state.text_channel:
-                    try:
-                        requester_id = state.requester_map.get(next_song.get("id", ""))
-                        requester = self.bot.get_user(requester_id) if requester_id else None
-                        embed = _now_playing_embed(state, next_song, requester)
-                        view = NowPlayingView(next_song, self, guild_id)
-                        await state.text_channel.send(embed=embed, view=view)
-                    except Exception:
-                        pass
-                return  # Successfully started playback
-            else:
-                logger.warning("Skipping song '%s' — no stream URL", next_song.get("name", ""))
-                state.current = None
-
-        # Queue is empty
-        state.current = None
-        state.playback_start_time = 0.0
-        # Only schedule idle disconnect if still connected to VC
-        if state.voice_client and state.voice_client.is_connected():
-            state.idle_task = asyncio.ensure_future(self._idle_disconnect(guild_id))
+        # ── Lock released — send the Now Playing embed ────────────
+        if text_ch:
+            try:
+                requester_id = state.requester_map.get(np_song.get("id", ""))
+                requester = self.bot.get_user(requester_id) if requester_id else None
+                embed = _now_playing_embed(state, np_song, requester)
+                view = NowPlayingView(np_song, self, guild_id)
+                await text_ch.send(embed=embed, view=view)
+            except Exception:
+                pass
 
     # ── Internal: idle disconnect ─────────────────────────────────────
 
@@ -2131,10 +2179,19 @@ class MusicCog(commands.Cog, name="Music"):
     # ── Internal: stop and leave ──────────────────────────────────────
 
     async def _stop_and_leave(self, guild_id: int) -> None:
-        """Stop playback, clear queue, and disconnect from VC."""
-        state = self._get_state(guild_id)
-        state.clear()
+        """Stop playback, clear queue, and disconnect from VC.
 
+        Sets ``_seeking = True`` before calling ``stop()`` so that the
+        ``after`` callback (``_play_next``) is a no-op and doesn't
+        race with the cleanup below.
+        """
+        state = self._get_state(guild_id)
+
+        # 1. Prevent the after-callback from doing anything.
+        state._seeking = True
+
+        # 2. Stop playback first (fires the after-callback synchronously
+        #    inside discord.py, but _seeking guard makes it a no-op).
         if state.voice_client:
             try:
                 if state.voice_client.is_playing() or state.voice_client.is_paused():
@@ -2143,6 +2200,9 @@ class MusicCog(commands.Cog, name="Music"):
             except Exception:
                 pass
             state.voice_client = None
+
+        # 3. Now it's safe to wipe everything.
+        state.clear()
 
     # ── Voice state change listener ───────────────────────────────────
 
@@ -2194,18 +2254,15 @@ class MusicCog(commands.Cog, name="Music"):
                     stream_url = resume.get("stream_url", "")
                     pos = resume.get("position", 0.0)
 
+                    # Re-sync the voice_client reference
+                    guild_vc = member.guild.voice_client
+                    if guild_vc and guild_vc.is_connected():
+                        state.voice_client = guild_vc  # type: ignore[assignment]
+
                     if stream_url and state.voice_client and state.voice_client.is_connected():
-                        # Tune encoder for the new connection
-                        try:
-                            enc = state.voice_client.encoder
-                            enc.set_bitrate(MAX_ENCODER_BITRATE)
-                            enc.set_signal_type('music')
-                            enc.set_bandwidth('full')
-                            enc.set_fec(True)
-                            enc.set_expected_packet_loss_percent(0.05)
-                        except Exception:
-                            pass
-                        await self._start_playback(guild_id, stream_url, seek_to=pos)
+                        self._tune_encoder(state.voice_client)
+                        async with state._lock:
+                            await self._start_playback(guild_id, stream_url, seek_to=pos)
                         if state.text_channel:
                             try:
                                 embed = Embedder.info(
