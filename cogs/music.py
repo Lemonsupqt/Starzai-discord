@@ -4047,13 +4047,14 @@ class DashboardMoreView(discord.ui.View):
         embed = Embedder.standard(
             "\U0001f4be Saved Song", desc, footer=BRAND, thumbnail=song.get("image"),
         )
+        await interaction.response.defer(ephemeral=True)
         try:
             await interaction.user.send(embed=embed)
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=Embedder.success("Saved", "\U0001f4be Sent to your DMs!"), ephemeral=True,
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=Embedder.error("DMs Closed", "Enable DMs from server members."), ephemeral=True,
             )
 
