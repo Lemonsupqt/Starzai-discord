@@ -2844,6 +2844,15 @@ class MusicCog(commands.Cog, name="Music"):
             while state.queue:
                 next_song = state.queue.pop(0)
                 state.current = next_song
+
+                # YouTube / SoundCloud URLs expire — refresh before playing
+                if next_song.get("source") in ("youtube", "soundcloud") and self.music_api:
+                    try:
+                        next_song = await self.music_api.refresh_stream_url(next_song)
+                        state.current = next_song
+                    except Exception as exc:
+                        logger.warning("Stream refresh failed for '%s': %s", next_song.get("name", ""), exc)
+
                 stream_url = _pick_best_url(next_song.get("download_urls", []), "320kbps")
                 if stream_url:
                     await self._start_playback(guild_id, stream_url)
