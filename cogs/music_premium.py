@@ -15,14 +15,14 @@ Commands:
     /musicprofile         — View your (or another user's) music profile
     /requestchannel       — Set up a song request channel
     /sleeptimer           — Set a sleep timer to auto-disconnect
-    /import               — Import a Spotify/Apple Music/YouTube Music playlist
+    /import               — Import a Spotify/Apple Music/YouTube Music/Tidal playlist
 
 Features:
     • Full interactive UI with buttons for playlists & favorites
     • Per-user music profiles with listening stats, top artists, top songs
     • Song request channel — just type a song name and it auto-queues
     • Sleep timer with live countdown
-    • Spotify, Apple Music & YouTube Music playlist/album import
+    • Spotify, Apple Music, YouTube Music & Tidal playlist/album import
 """
 
 from __future__ import annotations
@@ -1439,10 +1439,10 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
 
     @app_commands.command(
         name="import",
-        description="Import a Spotify, Apple Music, or YouTube Music playlist into a saved playlist",
+        description="Import a Spotify, Apple Music, YouTube Music, or Tidal playlist into a saved playlist",
     )
     @app_commands.describe(
-        url="Spotify, Apple Music, or YouTube Music playlist/album URL",
+        url="Spotify, Apple Music, YouTube Music, or Tidal playlist/album URL",
         playlist_name="Name for the imported playlist (auto-generated if blank)",
     )
     async def import_cmd(
@@ -1473,6 +1473,13 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
         yt_album_match = re.search(
             r"(?:https?://)?music\.youtube\.com/browse/(MPREb_[a-zA-Z0-9_-]+)", url
         )
+        # Tidal playlist and album patterns
+        tidal_playlist_match = re.search(
+            r"(?:https?://)?(?:listen\.)?tidal\.com/(?:browse/)?playlist/([a-f0-9-]+)", url
+        )
+        tidal_album_match = re.search(
+            r"(?:https?://)?(?:listen\.)?tidal\.com/(?:browse/)?album/(\d+)", url
+        )
 
         session = getattr(self._get_music_cog(), "_session", None)
         if not session:
@@ -1495,6 +1502,16 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                 playlist_id=yt_playlist_match.group(1) if yt_playlist_match else None,
                 browse_id=yt_album_match.group(1) if yt_album_match else None,
             )
+        elif tidal_playlist_match or tidal_album_match:
+            item_type = "playlist" if tidal_playlist_match else "album"
+            item_id = (
+                tidal_playlist_match.group(1)
+                if tidal_playlist_match
+                else tidal_album_match.group(1)
+            )
+            tracks, auto_name = await self._import_tidal(
+                session, item_type=item_type, item_id=item_id,
+            )
         else:
             await interaction.followup.send(
                 embed=Embedder.error(
@@ -1507,7 +1524,11 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                     "\u2022 `https://music.apple.com/.../album/...`\n"
                     "\u2022 `https://music.youtube.com/playlist?list=...`\n"
                     "\u2022 `https://music.youtube.com/browse/MPREb_...`\n"
-                    "\u2022 `https://youtube.com/playlist?list=...`",
+                    "\u2022 `https://youtube.com/playlist?list=...`\n"
+                    "\u2022 `https://tidal.com/browse/playlist/...`\n"
+                    "\u2022 `https://tidal.com/browse/album/...`\n"
+                    "\u2022 `https://listen.tidal.com/playlist/...`\n"
+                    "\u2022 `https://listen.tidal.com/album/...`",
                 ),
                 ephemeral=True,
             )
@@ -2039,6 +2060,240 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
             logger.warning("YouTube Music browse API failed: %s", exc)
 
         return tracks, name
+
+    # ── Tidal import helper ───────────────────────────────────────
+
+    async def _import_tidal(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        item_type: str,
+        item_id: str,
+    ) -> tuple:
+        """Extract track names from a Tidal playlist or album.
+
+        Strategy:
+          1. Use Tidal's oEmbed endpoint to retrieve the playlist/album title.
+          2. Fetch the Tidal embed page which renders track listings
+             server-side and parse the HTML for track data.
+          3. Fallback: scrape the main Tidal page ``<title>`` and any
+             structured ``<meta>`` / JSON-LD data available in the HTML.
+        """
+        tracks: List[Dict[str, str]] = []
+        name = "Tidal Import"
+
+        _HEADERS = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        canonical_url = f"https://tidal.com/browse/{item_type}/{item_id}"
+
+        try:
+            # ── Step 1: Get the title via oEmbed ──────────────────
+            try:
+                oembed_url = f"https://oembed.tidal.com/?url={canonical_url}"
+                async with session.get(
+                    oembed_url,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json(content_type=None)
+                        oembed_title = data.get("title", "")
+                        if oembed_title:
+                            name = oembed_title
+            except Exception:
+                pass  # title is a nice-to-have; continue even if this fails
+
+            # ── Step 2: Fetch the embed page ──────────────────────
+            embed_url = f"https://embed.tidal.com/{item_type}s/{item_id}"
+            async with session.get(
+                embed_url,
+                timeout=aiohttp.ClientTimeout(total=20),
+                headers=_HEADERS,
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+
+                    # The embed page often includes a JSON data blob with
+                    # track information in a <script> tag.
+                    # Look for track data in __NEXT_DATA__ or similar JSON blobs
+                    next_data_match = re.search(
+                        r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                        html,
+                        re.DOTALL,
+                    )
+                    if next_data_match:
+                        try:
+                            next_data = json.loads(next_data_match.group(1))
+                            tracks = self._extract_tidal_tracks_from_json(next_data)
+                        except json.JSONDecodeError:
+                            pass
+
+                    # Alternative: look for inline JSON state/data blobs
+                    if not tracks:
+                        state_match = re.search(
+                            r'window\.__INITIAL_STATE__\s*=\s*(\{.+?\});\s*</script>',
+                            html,
+                            re.DOTALL,
+                        )
+                        if state_match:
+                            try:
+                                state_data = json.loads(state_match.group(1))
+                                tracks = self._extract_tidal_tracks_from_json(state_data)
+                            except json.JSONDecodeError:
+                                pass
+
+                    # Fallback: parse structured meta / track patterns from HTML
+                    if not tracks:
+                        track_pattern = re.findall(
+                            r'"title"\s*:\s*"([^"]+)"[^}]*?"artist(?:Name|s?)"\s*:\s*"([^"]+)"',
+                            html,
+                        )
+                        for track_name, artist_name in track_pattern:
+                            if track_name and artist_name:
+                                tracks.append({"name": track_name, "artist": artist_name})
+
+            # ── Step 3: Fallback — scrape the main page ───────────
+            if not tracks:
+                async with session.get(
+                    canonical_url,
+                    timeout=aiohttp.ClientTimeout(total=20),
+                    headers=_HEADERS,
+                ) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+
+                        # Try to extract title if we don't have one yet
+                        if name == "Tidal Import":
+                            title_match = re.search(r'<title>([^<]+)</title>', html)
+                            if title_match:
+                                raw_title = title_match.group(1)
+                                raw_title = re.sub(
+                                    r'\s*[-\u2014]\s*(?:Tidal|TIDAL)\s*$', '', raw_title
+                                )
+                                if raw_title:
+                                    name = raw_title
+
+                        # Look for JSON-LD structured data
+                        json_ld_matches = re.findall(
+                            r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>',
+                            html,
+                            re.DOTALL,
+                        )
+                        for json_str in json_ld_matches:
+                            try:
+                                ld_data = json.loads(json_str)
+                                if isinstance(ld_data, dict):
+                                    ld_type = ld_data.get("@type", "")
+                                    if ld_type in ("MusicAlbum", "MusicPlaylist"):
+                                        for track in ld_data.get("track", []):
+                                            if isinstance(track, dict):
+                                                t_name = track.get("name", "")
+                                                t_artist = ""
+                                                by_artist = track.get("byArtist", {})
+                                                if isinstance(by_artist, dict):
+                                                    t_artist = by_artist.get("name", "")
+                                                elif isinstance(by_artist, list) and by_artist:
+                                                    t_artist = by_artist[0].get("name", "")
+                                                if t_name:
+                                                    tracks.append({
+                                                        "name": t_name,
+                                                        "artist": t_artist,
+                                                    })
+                            except json.JSONDecodeError:
+                                continue
+
+                        # Last resort: look for __NEXT_DATA__ on main page too
+                        if not tracks:
+                            next_match = re.search(
+                                r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+                                html,
+                                re.DOTALL,
+                            )
+                            if next_match:
+                                try:
+                                    nd = json.loads(next_match.group(1))
+                                    tracks = self._extract_tidal_tracks_from_json(nd)
+                                except json.JSONDecodeError:
+                                    pass
+
+                        # Pattern fallback on main page HTML
+                        if not tracks:
+                            track_pattern = re.findall(
+                                r'"title"\s*:\s*"([^"]+)"[^}]*?"artist(?:Name|s?)"\s*:\s*"([^"]+)"',
+                                html,
+                            )
+                            for track_name, artist_name in track_pattern:
+                                if track_name and artist_name:
+                                    tracks.append({"name": track_name, "artist": artist_name})
+
+        except Exception as exc:
+            logger.warning("Tidal import failed: %s", exc)
+
+        return tracks, name
+
+    @staticmethod
+    def _extract_tidal_tracks_from_json(data: Any) -> List[Dict[str, str]]:
+        """Recursively search a JSON blob for Tidal track listings.
+
+        Tidal embeds and pages may store track data in various nested
+        structures.  This helper walks the tree looking for arrays of
+        objects that contain ``title`` (or ``name``) and ``artist``
+        (or ``artists``) keys — the typical shape of a track item.
+        """
+        tracks: List[Dict[str, str]] = []
+
+        def _walk(obj: Any) -> None:
+            if isinstance(obj, dict):
+                # Check if this dict looks like a track item
+                title = obj.get("title") or obj.get("name") or ""
+                artist = ""
+                # artist could be a string, a dict, or a list
+                raw_artist = (
+                    obj.get("artist")
+                    or obj.get("artists")
+                    or obj.get("artistName")
+                    or ""
+                )
+                if isinstance(raw_artist, str):
+                    artist = raw_artist
+                elif isinstance(raw_artist, dict):
+                    artist = raw_artist.get("name", "")
+                elif isinstance(raw_artist, list):
+                    names = []
+                    for a in raw_artist:
+                        if isinstance(a, dict):
+                            names.append(a.get("name", ""))
+                        elif isinstance(a, str):
+                            names.append(a)
+                    artist = ", ".join(n for n in names if n)
+
+                # Heuristic: if we have both a title and artist and the
+                # object also has a duration/trackNumber, it's very
+                # likely a track item.
+                if title and artist and (
+                    "duration" in obj
+                    or "trackNumber" in obj
+                    or "trackId" in obj
+                    or "id" in obj
+                ):
+                    tracks.append({"name": str(title), "artist": str(artist)})
+                    return  # don't recurse into sub-fields of a matched track
+
+                # Otherwise keep searching
+                for v in obj.values():
+                    _walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item)
+
+        _walk(data)
+        return tracks
 
     @staticmethod
     def _extract_yt_initial_data(html: str) -> Optional[Dict[str, Any]]:
