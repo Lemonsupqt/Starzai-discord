@@ -548,27 +548,38 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                     state.text_channel = interaction.channel
 
                     if not first_played:
-                        # First song — connect and play immediately
-                        voice_channel = member.voice.channel
-                        try:
-                            vc = await music_cog._ensure_voice(interaction.guild, voice_channel, state)
-                            music_cog._tune_encoder(vc)
-                        except Exception:
-                            await interaction.followup.send(
-                                embed=Embedder.error("Connection Error", "\u274c Could not join the voice channel."),
-                                ephemeral=True,
-                            )
-                            return
+                        # First song — connect and play, or just queue if
+                        # something is already playing.
 
                         # Cancel idle if exists
                         if state.idle_task and not state.idle_task.done():
                             state.idle_task.cancel()
                             state.idle_task = None
 
-                        if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
-                            # Already playing — add to queue
+                        # Fast path: already connected and playing — just
+                        # queue without touching the encoder (avoids
+                        # audible glitches mid-stream).
+                        already_playing = (
+                            state.voice_client
+                            and state.voice_client.is_connected()
+                            and (state.voice_client.is_playing() or state.voice_client.is_paused())
+                        )
+
+                        if already_playing:
                             state.queue.append(resolved)
                         else:
+                            # Need to connect / ensure voice
+                            voice_channel = member.voice.channel
+                            try:
+                                vc = await music_cog._ensure_voice(interaction.guild, voice_channel, state)
+                                music_cog._tune_encoder(vc)
+                            except Exception:
+                                await interaction.followup.send(
+                                    embed=Embedder.error("Connection Error", "\u274c Could not join the voice channel."),
+                                    ephemeral=True,
+                                )
+                                return
+
                             state.current = resolved
                             await music_cog._start_playback(interaction.guild.id, stream_url)
                         first_played = True
@@ -1276,19 +1287,19 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                     state.requester_map[song["id"]] = message.author.id
                 state.text_channel = message.channel
 
-                voice_channel = member.voice.channel
-                try:
-                    vc = await music_cog._ensure_voice(message.guild, voice_channel, state)
-                    music_cog._tune_encoder(vc)
-                except Exception:
-                    await message.add_reaction("\u274c")
-                    return
-
                 if state.idle_task and not state.idle_task.done():
                     state.idle_task.cancel()
                     state.idle_task = None
 
-                if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
+                # Fast path: already connected and playing — just queue
+                # without touching the encoder (avoids audible glitches).
+                already_playing = (
+                    state.voice_client
+                    and state.voice_client.is_connected()
+                    and (state.voice_client.is_playing() or state.voice_client.is_paused())
+                )
+
+                if already_playing:
                     state.queue.append(song)
                     await message.remove_reaction("\U0001f3b5", self.bot.user)
                     await message.add_reaction("\u2705")
@@ -1306,6 +1317,14 @@ class MusicPremiumCog(commands.Cog, name="MusicPremium"):
                     except Exception:
                         pass
                 else:
+                    voice_channel = member.voice.channel
+                    try:
+                        vc = await music_cog._ensure_voice(message.guild, voice_channel, state)
+                        music_cog._tune_encoder(vc)
+                    except Exception:
+                        await message.add_reaction("\u274c")
+                        return
+
                     state.current = song
                     await music_cog._start_playback(guild_id, stream_url)
                     await message.remove_reaction("\U0001f3b5", self.bot.user)
