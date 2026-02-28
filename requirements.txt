@@ -9,3 +9,4 @@ reportlab>=4.0.0
 pyswisseph>=2.10.3
 geopy>=2.4.0
 pytz>=2024.1
+yt-dlp>=2024.1.0

@@ -1,9 +1,14 @@
 """
-Music API wrapper with multi-endpoint fallback.
+Music API wrapper with multi-provider cascading fallback.
 
-Searches and retrieves songs from multiple JioSaavn API mirrors,
-normalizing the response format across different endpoint variants.
-All user-facing references use "Powered by StarzAI" branding.
+Primary provider: JioSaavn (multiple API mirrors).
+Fallback providers: YouTube and SoundCloud (via yt-dlp).
+
+When JioSaavn returns no results for a query the search
+automatically cascades to YouTube, then SoundCloud.  All
+results are normalised into a common song-dict format so
+downstream code (playback, queue, embeds, download) is
+provider-agnostic.
 """
 
 from __future__ import annotations
@@ -197,20 +202,24 @@ def normalize_songs(songs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 class MusicAPI:
-    """Async wrapper around multiple JioSaavn API endpoints with automatic fallback."""
+    """Async wrapper with cascading provider fallback.
+
+    Search priority:
+        1. JioSaavn (multiple mirrors)
+        2. YouTube  (via yt-dlp)
+        3. SoundCloud (via yt-dlp)
+    """
 
     def __init__(self, session: aiohttp.ClientSession) -> None:
         self._session = session
 
     # ── Search ────────────────────────────────────────────────────────
 
-    async def search(self, query: str, limit: int = 7) -> Optional[List[Dict[str, Any]]]:
-        """
-        Search for songs across all API endpoints with automatic fallback.
+    async def _search_jiosaavn(self, query: str, limit: int = 7) -> Optional[List[Dict[str, Any]]]:
+        """Search JioSaavn across all mirrors.
 
-        Returns a normalised list of song dicts, an empty list ``[]`` if an
-        endpoint responded successfully but had no matches, or ``None`` if
-        every endpoint failed (network errors / non-200 responses).
+        Returns normalised results, ``[]`` if endpoints responded but
+        had no matches, or ``None`` if every mirror failed.
         """
         any_endpoint_succeeded = False
 
@@ -249,6 +258,9 @@ class MusicAPI:
                         any_endpoint_succeeded = True
                         normalised = normalize_songs(results)
                         if normalised:
+                            # Tag source so downstream knows the provider
+                            for s in normalised:
+                                s.setdefault("source", "jiosaavn")
                             logger.info(
                                 "Music search '%s' returned %d results from %s",
                                 query, len(normalised), api_base,
@@ -261,11 +273,60 @@ class MusicAPI:
                 logger.warning("Music API %s error for query '%s': %s", api_base, query, exc)
 
         if any_endpoint_succeeded:
-            # At least one endpoint responded but had no results
-            logger.info("Music search '%s' returned no results", query)
+            logger.info("JioSaavn search '%s' returned no results", query)
             return []
 
-        logger.error("All music APIs failed for query: %s", query)
+        logger.error("All JioSaavn mirrors failed for query: %s", query)
+        return None
+
+    # ── Cascading search ──────────────────────────────────────────────
+
+    async def search(self, query: str, limit: int = 7) -> Optional[List[Dict[str, Any]]]:
+        """
+        Search across **all providers** with automatic cascading fallback.
+
+        Order: JioSaavn → YouTube → SoundCloud.
+
+        Returns a normalised list of song dicts, ``[]`` if every
+        provider responded but had no matches, or ``None`` only if
+        the primary provider's mirrors all had network failures AND
+        the fallback providers also failed.
+        """
+        # 1) JioSaavn (primary)
+        results = await self._search_jiosaavn(query, limit=limit)
+        if results:  # non-empty list
+            return results
+
+        # 2) YouTube fallback (via yt-dlp)
+        try:
+            from utils.ytdlp_provider import search_youtube
+            yt_results = await search_youtube(query, limit=limit)
+            if yt_results:
+                logger.info(
+                    "YouTube fallback returned %d results for '%s'",
+                    len(yt_results), query,
+                )
+                return yt_results
+        except Exception as exc:
+            logger.warning("YouTube fallback failed for '%s': %s", query, exc)
+
+        # 3) SoundCloud fallback (via yt-dlp)
+        try:
+            from utils.ytdlp_provider import search_soundcloud
+            sc_results = await search_soundcloud(query, limit=limit)
+            if sc_results:
+                logger.info(
+                    "SoundCloud fallback returned %d results for '%s'",
+                    len(sc_results), query,
+                )
+                return sc_results
+        except Exception as exc:
+            logger.warning("SoundCloud fallback failed for '%s': %s", query, exc)
+
+        # All providers exhausted
+        if results is not None:
+            # At least JioSaavn responded (just had no results)
+            return []
         return None
 
     # ── Get song by ID ────────────────────────────────────────────────
@@ -324,9 +385,19 @@ class MusicAPI:
 
     async def ensure_download_urls(self, song: Dict[str, Any]) -> Dict[str, Any]:
         """
-        If a song object is missing download URLs, fetch them via get_song_by_id.
-        Returns the (potentially updated) song dict.
+        If a song object is missing download URLs, fetch them.
+
+        For JioSaavn songs this calls ``get_song_by_id``.
+        For YouTube / SoundCloud songs this re-extracts via yt-dlp
+        (stream URLs from those platforms expire after a few hours).
         """
+        source = song.get("source", "jiosaavn")
+
+        # ── YouTube / SoundCloud: always re-extract (URLs expire) ────
+        if source in ("youtube", "soundcloud") and song.get("webpage_url"):
+            return await self.refresh_stream_url(song)
+
+        # ── JioSaavn: fetch by ID if URLs are missing ────────────────
         if song.get("download_urls") and song.get("best_url"):
             return song
 
@@ -340,6 +411,25 @@ class MusicAPI:
             song["download_urls"] = full_song["download_urls"]
             song["best_url"] = full_song["best_url"]
 
+        return song
+
+    # ── Stream URL refresh (YouTube / SoundCloud) ─────────────────────
+
+    async def refresh_stream_url(self, song: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-extract a fresh audio URL for a yt-dlp sourced track.
+
+        YouTube / SoundCloud stream URLs expire after a few hours.
+        This method fetches a new one using the permanent
+        ``webpage_url`` stored in the song dict.
+        """
+        try:
+            from utils.ytdlp_provider import refresh_song
+            song = await refresh_song(song)
+        except Exception as exc:
+            logger.warning(
+                "Stream URL refresh failed for '%s': %s",
+                song.get("name", ""), exc,
+            )
         return song
 
 
