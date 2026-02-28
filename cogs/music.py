@@ -123,7 +123,7 @@ MAX_FILENAME_LEN = 100  # max chars for sanitised filenames
 # ── Timeouts ─────────────────────────────────────────────────────────
 VIEW_TIMEOUT = 60  # seconds for interactive views
 VC_IDLE_TIMEOUT = 300  # 5 minutes idle before auto-disconnect
-NP_UPDATE_INTERVAL = 10  # seconds between live progress-bar edits
+NP_UPDATE_INTERVAL = 2  # seconds between live progress-bar edits
 
 # ── FFmpeg / voice quality ──────────────────────────────────────────
 # NOTE: FFmpeg must be installed on the host system for VC playback.
@@ -2042,6 +2042,8 @@ class MusicCog(commands.Cog, name="Music"):
                 )
             )
         else:
+            # Remove any auto-queued songs still waiting in the queue
+            state.queue = [s for s in state.queue if not s.get("_autoplay")]
             await interaction.response.send_message(
                 embed=Embedder.info(
                     "Autoplay Disabled",
@@ -2630,6 +2632,35 @@ class MusicCog(commands.Cog, name="Music"):
                 state.requester_map[song["id"]] = interaction.user.id
             state.text_channel = interaction.channel
 
+            # Fast path: if already connected and playing, just queue
+            # without touching the voice client or encoder (avoids
+            # audible glitches from reconfiguring the Opus encoder
+            # mid-stream).
+            already_playing = (
+                state.voice_client
+                and state.voice_client.is_connected()
+                and (state.voice_client.is_playing() or state.voice_client.is_paused())
+            )
+
+            if already_playing:
+                # Cancel idle task if it exists
+                if state.idle_task and not state.idle_task.done():
+                    state.idle_task.cancel()
+                    state.idle_task = None
+
+                state.queue.append(song)
+                pos = len(state.queue)
+                await self._send(
+                    interaction,
+                    embed=Embedder.standard(
+                        "\U0001f3b5 Added to Queue",
+                        f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
+                        footer=BRAND,
+                    ),
+                    followup=followup,
+                )
+                return
+
             # Connect to VC using the safe helper
             try:
                 vc = await self._ensure_voice(interaction.guild, voice_channel, state)
@@ -2647,21 +2678,6 @@ class MusicCog(commands.Cog, name="Music"):
             if state.idle_task and not state.idle_task.done():
                 state.idle_task.cancel()
                 state.idle_task = None
-
-            # If already playing, queue the song — do NOT touch playback
-            if state.voice_client and (state.voice_client.is_playing() or state.voice_client.is_paused()):
-                state.queue.append(song)
-                pos = len(state.queue)
-                await self._send(
-                    interaction,
-                    embed=Embedder.standard(
-                        "\U0001f3b5 Added to Queue",
-                        f"**{song['name']}** \u2014 {song['artist']}\nPosition: #{pos}",
-                        footer=BRAND,
-                    ),
-                    followup=followup,
-                )
-                return
 
             # Nothing playing — start playback immediately
             state.current = song
@@ -2807,9 +2823,15 @@ class MusicCog(commands.Cog, name="Music"):
                             # Filter out the song that just played
                             current_id = state.current.get("id", "")
                             for s in suggestions:
+                                # Re-check autoplay each iteration — user may
+                                # toggle it off while we're resolving URLs.
+                                if not state.autoplay:
+                                    autoplay_triggered = False
+                                    break
                                 if s.get("id") != current_id:
                                     s = await self.music_api.ensure_download_urls(s)
                                     if _pick_best_url(s.get("download_urls", []), "320kbps"):
+                                        s["_autoplay"] = True
                                         state.queue.append(s)
                             logger.info(
                                 "Autoplay: queued %d songs by '%s' in guild %d",
@@ -3742,10 +3764,378 @@ class DashboardHistoryView(discord.ui.View):
         await self.parent.return_to_main(interaction)
 
 
+# ── Create Playlist Modal ─────────────────────────────────────────────
+
+class DashboardCreatePlaylistModal(discord.ui.Modal, title="\U0001f4c1 Create Playlist"):
+    """Modal to create a new playlist."""
+
+    name_input = discord.ui.TextInput(
+        label="Playlist name",
+        placeholder="e.g. Chill Vibes, Workout Mix",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=100,
+    )
+
+    def __init__(self, cog: "MusicCog", guild_id: int, parent: "MusicDashboardView", user_id: int) -> None:
+        super().__init__()
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.user_id = user_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        name = self.name_input.value.strip()
+        if not name:
+            await interaction.response.send_message("\u274c Please enter a name.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        uid = str(self.user_id)
+        pl_id = await db.create_playlist(uid, name)
+        if pl_id is None:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", f"Could not create playlist. Name **{name}** may already exist."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=Embedder.success("Created", f"\U0001f4c1 Playlist **{name}** created!"),
+            ephemeral=True,
+        )
+
+        # Refresh playlists sub-view
+        try:
+            playlists = await db.get_playlists(uid)
+            sub_view = DashboardPlaylistsView(self.cog, self.guild_id, self.parent, playlists, self.user_id)
+            if self.parent._message:
+                await self.parent._message.edit(embed=sub_view._build_embed(), view=sub_view)
+        except Exception:
+            pass
+
+
+class DashboardRenamePlaylistModal(discord.ui.Modal, title="\u270f Rename Playlist"):
+    """Modal to rename an existing playlist."""
+
+    name_input = discord.ui.TextInput(
+        label="New playlist name",
+        placeholder="Enter a new name",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=100,
+    )
+
+    def __init__(
+        self,
+        cog: "MusicCog",
+        guild_id: int,
+        parent: "MusicDashboardView",
+        user_id: int,
+        playlist: Dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.user_id = user_id
+        self.playlist = playlist
+        self.name_input.default = playlist["name"]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        new_name = self.name_input.value.strip()
+        if not new_name:
+            await interaction.response.send_message("\u274c Please enter a name.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        uid = str(self.user_id)
+        ok = await db.rename_playlist(uid, self.playlist["id"], new_name)
+        if not ok:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", "Could not rename. Name may already exist."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=Embedder.success("Renamed", f"\u270f **{self.playlist['name']}** \u2192 **{new_name}**"),
+            ephemeral=True,
+        )
+
+        # Refresh playlists sub-view
+        try:
+            playlists = await db.get_playlists(uid)
+            sub_view = DashboardPlaylistsView(self.cog, self.guild_id, self.parent, playlists, self.user_id)
+            if self.parent._message:
+                await self.parent._message.edit(embed=sub_view._build_embed(), view=sub_view)
+        except Exception:
+            pass
+
+
+# ── Playlist Songs Sub-View (view/remove songs in a playlist) ────────
+
+DASH_PL_SONGS_PAGE = 10
+
+class DashboardPlaylistSongsView(discord.ui.View):
+    """Sub-view showing songs inside a specific playlist with remove capability."""
+
+    def __init__(
+        self,
+        cog: "MusicCog",
+        guild_id: int,
+        parent: "MusicDashboardView",
+        playlist: Dict[str, Any],
+        songs: List[Dict[str, Any]],
+        user_id: int,
+        page: int = 0,
+    ) -> None:
+        super().__init__(timeout=DASH_TIMEOUT)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.parent = parent
+        self.playlist = playlist
+        self.songs = songs
+        self.user_id = user_id
+        self.page = page
+        self._selected_position: Optional[int] = None
+        self._build()
+
+    @property
+    def total_pages(self) -> int:
+        total = len(self.songs)
+        if total == 0:
+            return 1
+        return (total + DASH_PL_SONGS_PAGE - 1) // DASH_PL_SONGS_PAGE
+
+    def _build(self) -> None:
+        self.clear_items()
+
+        # Song select dropdown (current page songs)
+        if self.songs:
+            start = self.page * DASH_PL_SONGS_PAGE
+            end = start + DASH_PL_SONGS_PAGE
+            page_songs = self.songs[start:end]
+
+            options: List[discord.SelectOption] = []
+            for i, s in enumerate(page_songs, start):
+                label = f"{i + 1}. {s.get('name', 'Unknown')}"[:100]
+                desc = f"{s.get('artist', 'Unknown')} \u2022 {s.get('duration_formatted', '?:??')}"[:100]
+                options.append(discord.SelectOption(label=label, description=desc, value=str(i)))
+
+            if options:
+                select = discord.ui.Select(
+                    placeholder="Select a song to remove\u2026",
+                    options=options,
+                    custom_id="dpl_song_select",
+                    row=0,
+                )
+                select.callback = self._on_song_select
+                self.add_item(select)
+
+        # Row 1: Navigation + Remove
+        prev_btn = discord.ui.Button(label="\u25c0", style=discord.ButtonStyle.secondary, custom_id="dplsong_prev", row=1, disabled=self.page <= 0)
+        prev_btn.callback = self._prev_page
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(label="\u25b6", style=discord.ButtonStyle.secondary, custom_id="dplsong_next", row=1, disabled=self.page >= self.total_pages - 1)
+        next_btn.callback = self._next_page
+        self.add_item(next_btn)
+
+        remove_btn = discord.ui.Button(label="\U0001f5d1 Remove", style=discord.ButtonStyle.danger, custom_id="dplsong_remove", row=1, disabled=self._selected_position is None)
+        remove_btn.callback = self._remove_selected
+        self.add_item(remove_btn)
+
+        clear_btn = discord.ui.Button(label="\U0001f9f9 Clear All", style=discord.ButtonStyle.danger, custom_id="dplsong_clear", row=1, disabled=not self.songs)
+        clear_btn.callback = self._clear_all
+        self.add_item(clear_btn)
+
+        # Row 2: Play + Add current song + Back
+        play_btn = discord.ui.Button(label="\u25b6 Play All", style=discord.ButtonStyle.success, custom_id="dplsong_play", row=2, disabled=not self.songs)
+        play_btn.callback = self._play_all
+        self.add_item(play_btn)
+
+        shuffle_btn = discord.ui.Button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.primary, custom_id="dplsong_shuffle", row=2, disabled=not self.songs)
+        shuffle_btn.callback = self._shuffle_play
+        self.add_item(shuffle_btn)
+
+        # Add current song to this playlist
+        state = self.cog._get_state(self.guild_id)
+        add_btn = discord.ui.Button(label="\u2795 Add Now Playing", style=discord.ButtonStyle.primary, custom_id="dplsong_addcurrent", row=2, disabled=not state.current)
+        add_btn.callback = self._add_current_song
+        self.add_item(add_btn)
+
+        back_btn = discord.ui.Button(label="\u2190 Playlists", style=discord.ButtonStyle.danger, custom_id="dplsong_back", row=2)
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
+
+    def _build_embed(self) -> discord.Embed:
+        pl = self.playlist
+        if not self.songs:
+            return Embedder.standard(
+                f"\U0001f4c1 {pl['name']}",
+                "This playlist is empty.\n\nUse **\u2795 Add Now Playing** to add the current song.",
+                footer=BRAND,
+            )
+
+        start = self.page * DASH_PL_SONGS_PAGE
+        end = start + DASH_PL_SONGS_PAGE
+        page_songs = self.songs[start:end]
+
+        lines: List[str] = []
+        for i, s in enumerate(page_songs, start + 1):
+            dur = s.get("duration_formatted", "?:??")
+            marker = " \u25c0" if self._selected_position == (i - 1) else ""
+            lines.append(f"**{i}.** {s['name']} \u2014 {s['artist']}  `{dur}`{marker}")
+
+        total_dur = sum(s.get("duration", 0) for s in self.songs)
+        dur_m, dur_s = divmod(int(total_dur), 60)
+        dur_h, dur_m = divmod(dur_m, 60)
+        dur_str = f"{dur_h}h {dur_m}m" if dur_h else f"{dur_m}m {dur_s}s"
+
+        return Embedder.standard(
+            f"\U0001f4c1 {pl['name']}",
+            "\n".join(lines)[:MAX_EMBED_DESC],
+            footer=f"{len(self.songs)} songs \u2022 {dur_str} \u2022 Page {self.page + 1}/{self.total_pages} \u2022 {BRAND}",
+        )
+
+    async def _on_song_select(self, interaction: discord.Interaction) -> None:
+        self._selected_position = int(interaction.data["values"][0])
+        self._build()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _prev_page(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+        self._selected_position = None
+        self._build()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _next_page(self, interaction: discord.Interaction) -> None:
+        if self.page < self.total_pages - 1:
+            self.page += 1
+        self._selected_position = None
+        self._build()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _remove_selected(self, interaction: discord.Interaction) -> None:
+        if self._selected_position is None:
+            await interaction.response.send_message("Select a song first.", ephemeral=True)
+            return
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        pos = self._selected_position
+        song_name = self.songs[pos]["name"] if pos < len(self.songs) else "song"
+        song_pos = self.songs[pos].get("_position", pos)
+        ok = await db.remove_song_from_playlist(self.playlist["id"], song_pos)
+        if ok:
+            # Reload songs
+            self.songs = await db.get_playlist_songs(self.playlist["id"])
+            self._selected_position = None
+            if self.page >= self.total_pages:
+                self.page = max(0, self.total_pages - 1)
+            self._build()
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", f"Could not remove **{song_name}**."),
+                ephemeral=True,
+            )
+
+    async def _clear_all(self, interaction: discord.Interaction) -> None:
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+        removed = await db.clear_playlist(self.playlist["id"])
+        self.songs = []
+        self._selected_position = None
+        self.page = 0
+        self._build()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _play_all(self, interaction: discord.Interaction) -> None:
+        if not self.songs:
+            await interaction.response.send_message("Playlist is empty.", ephemeral=True)
+            return
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await premium_cog._queue_songs(interaction, self.songs, self.playlist["name"])
+        await asyncio.sleep(1.0)
+        try:
+            await self.parent.return_to_main(interaction, followup=True)
+        except Exception:
+            pass
+
+    async def _shuffle_play(self, interaction: discord.Interaction) -> None:
+        if not self.songs:
+            await interaction.response.send_message("Playlist is empty.", ephemeral=True)
+            return
+        premium_cog = self.cog.bot.get_cog("MusicPremium")
+        if not premium_cog:
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        shuffled = list(self.songs)
+        random.shuffle(shuffled)
+        await premium_cog._queue_songs(interaction, shuffled, f"{self.playlist['name']} (Shuffled)")
+        await asyncio.sleep(1.0)
+        try:
+            await self.parent.return_to_main(interaction, followup=True)
+        except Exception:
+            pass
+
+    async def _add_current_song(self, interaction: discord.Interaction) -> None:
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        key = _song_key(state.current)
+        ok = await db.add_song_to_playlist(self.playlist["id"], key)
+        if ok:
+            self.songs = await db.get_playlist_songs(self.playlist["id"])
+            self._selected_position = None
+            self._build()
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", "Could not add song."),
+                ephemeral=True,
+            )
+
+    async def _go_back(self, interaction: discord.Interaction) -> None:
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await self.parent.return_to_main(interaction)
+            return
+        playlists = await db.get_playlists(str(self.user_id))
+        sub_view = DashboardPlaylistsView(self.cog, self.guild_id, self.parent, playlists, self.user_id)
+        await interaction.response.edit_message(embed=sub_view._build_embed(), view=sub_view)
+
+
 # ── Playlists Sub-View ───────────────────────────────────────────────
 
 class DashboardPlaylistsView(discord.ui.View):
-    """Sub-view showing user's playlists with a select menu to play them."""
+    """Sub-view showing user's playlists with full management: play, create, rename, delete, view songs."""
 
     def __init__(
         self,
@@ -3761,30 +4151,68 @@ class DashboardPlaylistsView(discord.ui.View):
         self.parent = parent
         self.playlists = playlists
         self.user_id = user_id
+        self._selected_id: Optional[int] = None
         self._build()
 
     def _build(self) -> None:
-        if not self.playlists:
-            return
+        self.clear_items()
 
-        options: List[discord.SelectOption] = []
-        for pl in self.playlists[:25]:
-            label = pl["name"][:100]
-            desc = f"{pl['song_count']} song{'s' if pl['song_count'] != 1 else ''}"
-            options.append(
-                discord.SelectOption(label=label, description=desc, value=str(pl["id"]))
+        # Row 0: Playlist select dropdown
+        if self.playlists:
+            options: List[discord.SelectOption] = []
+            for pl in self.playlists[:25]:
+                label = pl["name"][:100]
+                desc = f"{pl['song_count']} song{'s' if pl['song_count'] != 1 else ''}"
+                options.append(
+                    discord.SelectOption(
+                        label=label, description=desc, value=str(pl["id"]),
+                        default=(pl["id"] == self._selected_id),
+                    )
+                )
+
+            select = discord.ui.Select(
+                placeholder="Select a playlist\u2026",
+                options=options,
+                custom_id="dpl_select",
+                row=0,
             )
+            select.callback = self._on_select
+            self.add_item(select)
 
-        select = discord.ui.Select(
-            placeholder="Select a playlist to play\u2026",
-            options=options,
-            custom_id="dpl_select",
-            row=0,
+        # Row 1: Actions (require selection)
+        has_selection = self._selected_id is not None
+
+        play_btn = discord.ui.Button(label="\u25b6 Play", style=discord.ButtonStyle.success, custom_id="dpl_play", row=1, disabled=not has_selection)
+        play_btn.callback = self._play_playlist
+        self.add_item(play_btn)
+
+        view_btn = discord.ui.Button(label="\U0001f4c4 Songs", style=discord.ButtonStyle.primary, custom_id="dpl_view", row=1, disabled=not has_selection)
+        view_btn.callback = self._view_songs
+        self.add_item(view_btn)
+
+        rename_btn = discord.ui.Button(label="\u270f Rename", style=discord.ButtonStyle.secondary, custom_id="dpl_rename", row=1, disabled=not has_selection)
+        rename_btn.callback = self._rename_playlist
+        self.add_item(rename_btn)
+
+        delete_btn = discord.ui.Button(label="\U0001f5d1 Delete", style=discord.ButtonStyle.danger, custom_id="dpl_delete", row=1, disabled=not has_selection)
+        delete_btn.callback = self._delete_playlist
+        self.add_item(delete_btn)
+
+        # Row 2: Create new + Add current song + Back
+        create_btn = discord.ui.Button(label="\u2795 New Playlist", style=discord.ButtonStyle.success, custom_id="dpl_create", row=2)
+        create_btn.callback = self._create_playlist
+        self.add_item(create_btn)
+
+        state = self.cog._get_state(self.guild_id)
+        add_btn = discord.ui.Button(
+            label="\U0001f3b5 Add Now Playing", style=discord.ButtonStyle.primary,
+            custom_id="dpl_addcurrent", row=2,
+            disabled=not (has_selection and state.current),
         )
-        select.callback = self._on_select
-        self.add_item(select)
+        add_btn.callback = self._add_current_to_playlist
+        self.add_item(add_btn)
 
-        back_btn = discord.ui.Button(label="\u2190 Back", style=discord.ButtonStyle.danger, custom_id="dpl_back", row=1)
+        back_btn = discord.ui.Button(label="\u2190 Back", style=discord.ButtonStyle.danger, custom_id="dpl_back", row=2)
         back_btn.callback = self._go_back
         self.add_item(back_btn)
 
@@ -3792,43 +4220,49 @@ class DashboardPlaylistsView(discord.ui.View):
         if not self.playlists:
             return Embedder.standard(
                 "\U0001f4c1 Your Playlists",
-                "You don\u2019t have any playlists yet!\n\nUse `/playlist create` to make one.",
+                "You don\u2019t have any playlists yet!\n\n"
+                "Use **\u2795 New Playlist** below to create one.",
                 footer=BRAND,
             )
 
         lines: List[str] = []
         for i, pl in enumerate(self.playlists, 1):
-            lines.append(f"**{i}.** {pl['name']} \u2014 `{pl['song_count']} songs`")
+            marker = " \u25c0" if pl["id"] == self._selected_id else ""
+            lines.append(f"**{i}.** {pl['name']} \u2014 `{pl['song_count']} songs`{marker}")
 
         return Embedder.standard(
             "\U0001f4c1 Your Playlists",
             "\n".join(lines)[:MAX_EMBED_DESC],
-            footer=f"{len(self.playlists)} playlists \u2022 Select one to play \u2022 {BRAND}",
+            footer=f"{len(self.playlists)} playlists \u2022 Select one to manage \u2022 {BRAND}",
         )
 
+    def _get_selected_playlist(self) -> Optional[Dict[str, Any]]:
+        if self._selected_id is None:
+            return None
+        return next((p for p in self.playlists if p["id"] == self._selected_id), None)
+
     async def _on_select(self, interaction: discord.Interaction) -> None:
-        playlist_id = int(interaction.data["values"][0])
-        playlist = next((p for p in self.playlists if p["id"] == playlist_id), None)
+        self._selected_id = int(interaction.data["values"][0])
+        self._build()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _play_playlist(self, interaction: discord.Interaction) -> None:
+        playlist = self._get_selected_playlist()
         if not playlist:
-            await interaction.response.send_message("\u274c Playlist not found.", ephemeral=True)
+            await interaction.response.send_message("Select a playlist first.", ephemeral=True)
             return
 
         premium_cog = self.cog.bot.get_cog("MusicPremium")
         if not premium_cog:
-            await interaction.response.send_message(
-                embed=Embedder.error("Unavailable", "Playlist system unavailable."),
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Unavailable.", ephemeral=True)
             return
 
         db = getattr(self.cog.bot, "database", None)
         if not db:
-            await interaction.response.send_message(
-                embed=Embedder.error("Unavailable", "Database is not available."),
-                ephemeral=True,
-            )
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
             return
-        songs = await db.get_playlist_songs(playlist_id)
+
+        songs = await db.get_playlist_songs(playlist["id"])
         if not songs:
             await interaction.response.send_message(
                 embed=Embedder.warning("Empty", f"**{playlist['name']}** has no songs."),
@@ -3839,23 +4273,167 @@ class DashboardPlaylistsView(discord.ui.View):
         await interaction.response.defer()
         await premium_cog._queue_songs(interaction, songs, playlist["name"])
 
-        # Return to main after loading
         await asyncio.sleep(1.0)
         try:
             await self.parent.return_to_main(interaction, followup=True)
         except Exception:
             pass
 
+    async def _view_songs(self, interaction: discord.Interaction) -> None:
+        playlist = self._get_selected_playlist()
+        if not playlist:
+            await interaction.response.send_message("Select a playlist first.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        songs = await db.get_playlist_songs(playlist["id"])
+        sub_view = DashboardPlaylistSongsView(
+            self.cog, self.guild_id, self.parent, playlist, songs, self.user_id
+        )
+        await interaction.response.edit_message(embed=sub_view._build_embed(), view=sub_view)
+
+    async def _rename_playlist(self, interaction: discord.Interaction) -> None:
+        playlist = self._get_selected_playlist()
+        if not playlist:
+            await interaction.response.send_message("Select a playlist first.", ephemeral=True)
+            return
+        modal = DashboardRenamePlaylistModal(
+            self.cog, self.guild_id, self.parent, self.user_id, playlist
+        )
+        await interaction.response.send_modal(modal)
+
+    async def _delete_playlist(self, interaction: discord.Interaction) -> None:
+        playlist = self._get_selected_playlist()
+        if not playlist:
+            await interaction.response.send_message("Select a playlist first.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        uid = str(self.user_id)
+        ok = await db.delete_playlist(uid, playlist["id"])
+        if ok:
+            self.playlists = await db.get_playlists(uid)
+            self._selected_id = None
+            self._build()
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", "Could not delete playlist."),
+                ephemeral=True,
+            )
+
+    async def _create_playlist(self, interaction: discord.Interaction) -> None:
+        modal = DashboardCreatePlaylistModal(
+            self.cog, self.guild_id, self.parent, self.user_id
+        )
+        await interaction.response.send_modal(modal)
+
+    async def _add_current_to_playlist(self, interaction: discord.Interaction) -> None:
+        playlist = self._get_selected_playlist()
+        if not playlist:
+            await interaction.response.send_message("Select a playlist first.", ephemeral=True)
+            return
+
+        state = self.cog._get_state(self.guild_id)
+        if not state.current:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        key = _song_key(state.current)
+        ok = await db.add_song_to_playlist(playlist["id"], key)
+        if ok:
+            # Refresh playlist counts
+            self.playlists = await db.get_playlists(str(self.user_id))
+            self._build()
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", "Could not add song to playlist."),
+                ephemeral=True,
+            )
+
     async def _go_back(self, interaction: discord.Interaction) -> None:
         await self.parent.return_to_main(interaction)
+
+
+# ── Add-to-Playlist select for favorites ─────────────────────────────
+
+class DashboardFavAddToPlaylistView(discord.ui.View):
+    """Ephemeral sub-view: pick a playlist to add the selected favorite to."""
+
+    def __init__(
+        self,
+        cog: "MusicCog",
+        playlists: List[Dict[str, Any]],
+        song: Dict[str, Any],
+        user_id: int,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.playlists = playlists
+        self.song = song
+        self.user_id = user_id
+        self._build()
+
+    def _build(self) -> None:
+        if not self.playlists:
+            return
+
+        options: List[discord.SelectOption] = []
+        for pl in self.playlists[:25]:
+            label = pl["name"][:100]
+            desc = f"{pl['song_count']} songs"
+            options.append(discord.SelectOption(label=label, description=desc, value=str(pl["id"])))
+
+        select = discord.ui.Select(
+            placeholder="Add to which playlist?",
+            options=options,
+            custom_id="dfav_addpl_select",
+            row=0,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        playlist_id = int(interaction.data["values"][0])
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        key = _song_key(self.song)
+        ok = await db.add_song_to_playlist(playlist_id, key)
+        pl_name = next((p["name"] for p in self.playlists if p["id"] == playlist_id), "playlist")
+        if ok:
+            await interaction.response.edit_message(
+                content=f"\u2705 Added **{self.song.get('name', 'song')}** to **{pl_name}**!",
+                embed=None, view=None,
+            )
+        else:
+            await interaction.response.edit_message(
+                content="\u274c Could not add song to playlist.", embed=None, view=None,
+            )
 
 
 # ── Favorites Sub-View ───────────────────────────────────────────────
 
 class DashboardFavoritesView(discord.ui.View):
-    """Sub-view for user's favorites with play-all and shuffle."""
+    """Sub-view for user's favorites with individual removal, add-to-playlist, play, and shuffle."""
 
-    SONGS_PER_PAGE = 8
+    SONGS_PER_PAGE = 10
 
     def __init__(
         self,
@@ -3873,6 +4451,8 @@ class DashboardFavoritesView(discord.ui.View):
         self.favorites = favorites
         self.user_id = user_id
         self.page = page
+        self._selected_idx: Optional[int] = None
+        self._build()
 
     @property
     def total_pages(self) -> int:
@@ -3880,6 +4460,63 @@ class DashboardFavoritesView(discord.ui.View):
         if total == 0:
             return 1
         return (total + self.SONGS_PER_PAGE - 1) // self.SONGS_PER_PAGE
+
+    def _build(self) -> None:
+        self.clear_items()
+
+        # Row 0: Song select dropdown (current page)
+        if self.favorites:
+            start = self.page * self.SONGS_PER_PAGE
+            end = start + self.SONGS_PER_PAGE
+            page_songs = self.favorites[start:end]
+
+            options: List[discord.SelectOption] = []
+            for i, song in enumerate(page_songs, start):
+                label = f"{i + 1}. {song.get('name', 'Unknown')}"[:100]
+                desc = f"{song.get('artist', 'Unknown')} \u2022 {song.get('duration_formatted', '?:??')}"[:100]
+                options.append(discord.SelectOption(label=label, description=desc, value=str(i)))
+
+            if options:
+                select = discord.ui.Select(
+                    placeholder="Select a song\u2026",
+                    options=options,
+                    custom_id="dfav_select",
+                    row=0,
+                )
+                select.callback = self._on_select
+                self.add_item(select)
+
+        # Row 1: Navigation + Remove + Add to Playlist
+        has_selection = self._selected_idx is not None
+
+        prev_btn = discord.ui.Button(label="\u25c0", style=discord.ButtonStyle.secondary, custom_id="dfav_prev", row=1, disabled=self.page <= 0)
+        prev_btn.callback = self._prev_page
+        self.add_item(prev_btn)
+
+        next_btn = discord.ui.Button(label="\u25b6", style=discord.ButtonStyle.secondary, custom_id="dfav_next", row=1, disabled=self.page >= self.total_pages - 1)
+        next_btn.callback = self._next_page
+        self.add_item(next_btn)
+
+        remove_btn = discord.ui.Button(label="\U0001f5d1 Remove", style=discord.ButtonStyle.danger, custom_id="dfav_remove", row=1, disabled=not has_selection)
+        remove_btn.callback = self._remove_selected
+        self.add_item(remove_btn)
+
+        add_pl_btn = discord.ui.Button(label="\U0001f4c1 To Playlist", style=discord.ButtonStyle.primary, custom_id="dfav_addpl", row=1, disabled=not has_selection)
+        add_pl_btn.callback = self._add_to_playlist
+        self.add_item(add_pl_btn)
+
+        # Row 2: Play All + Shuffle + Back
+        play_btn = discord.ui.Button(label="\u25b6 Play All", style=discord.ButtonStyle.success, custom_id="dfav_play", row=2, disabled=not self.favorites)
+        play_btn.callback = self._play_all
+        self.add_item(play_btn)
+
+        shuffle_btn = discord.ui.Button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.primary, custom_id="dfav_shuffle", row=2, disabled=not self.favorites)
+        shuffle_btn.callback = self._shuffle_play
+        self.add_item(shuffle_btn)
+
+        back_btn = discord.ui.Button(label="\u2190 Back", style=discord.ButtonStyle.danger, custom_id="dfav_back", row=2)
+        back_btn.callback = self._go_back
+        self.add_item(back_btn)
 
     def _build_embed(self) -> discord.Embed:
         if not self.favorites:
@@ -3896,7 +4533,8 @@ class DashboardFavoritesView(discord.ui.View):
         lines: List[str] = []
         for i, song in enumerate(page_songs, start + 1):
             dur = song.get("duration_formatted", "?:??")
-            lines.append(f"**{i}.** {song['name']} \u2014 {song['artist']}  `{dur}`")
+            marker = " \u25c0" if self._selected_idx == (i - 1) else ""
+            lines.append(f"**{i}.** {song['name']} \u2014 {song['artist']}  `{dur}`{marker}")
 
         return Embedder.standard(
             "\u2764\ufe0f Your Favorites",
@@ -3904,20 +4542,92 @@ class DashboardFavoritesView(discord.ui.View):
             footer=f"{len(self.favorites)} songs \u2022 Page {self.page + 1}/{self.total_pages} \u2022 {BRAND}",
         )
 
-    @discord.ui.button(label="\u25c0 Prev", style=discord.ButtonStyle.secondary, row=0)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        self._selected_idx = int(interaction.data["values"][0])
+        self._build()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def _prev_page(self, interaction: discord.Interaction) -> None:
         if self.page > 0:
             self.page -= 1
+        self._selected_idx = None
+        self._build()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
-    @discord.ui.button(label="\u25b6 Next", style=discord.ButtonStyle.secondary, row=0)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _next_page(self, interaction: discord.Interaction) -> None:
         if self.page < self.total_pages - 1:
             self.page += 1
+        self._selected_idx = None
+        self._build()
         await interaction.response.edit_message(embed=self._build_embed(), view=self)
 
-    @discord.ui.button(label="\u25b6 Play All", style=discord.ButtonStyle.success, emoji="\U0001f3b5", row=0)
-    async def play_all_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _remove_selected(self, interaction: discord.Interaction) -> None:
+        if self._selected_idx is None or self._selected_idx >= len(self.favorites):
+            await interaction.response.send_message("Select a song first.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        song = self.favorites[self._selected_idx]
+        uid = str(self.user_id)
+
+        # Use _fav_id if available, otherwise fall back to song_key
+        fav_id = song.get("_fav_id")
+        if fav_id:
+            ok = await db.remove_favorite_by_id(uid, fav_id)
+        else:
+            key = _song_key(song)
+            ok = await db.remove_favorite(uid, key)
+
+        if ok:
+            # Reload favorites
+            self.favorites = await db.get_favorites(uid, limit=500)
+            self._selected_idx = None
+            if self.page >= self.total_pages:
+                self.page = max(0, self.total_pages - 1)
+            self._build()
+            await interaction.response.edit_message(embed=self._build_embed(), view=self)
+        else:
+            await interaction.response.send_message(
+                embed=Embedder.error("Error", f"Could not remove **{song.get('name', 'song')}**."),
+                ephemeral=True,
+            )
+
+    async def _add_to_playlist(self, interaction: discord.Interaction) -> None:
+        if self._selected_idx is None or self._selected_idx >= len(self.favorites):
+            await interaction.response.send_message("Select a song first.", ephemeral=True)
+            return
+
+        db = getattr(self.cog.bot, "database", None)
+        if not db:
+            await interaction.response.send_message("Database unavailable.", ephemeral=True)
+            return
+
+        uid = str(self.user_id)
+        playlists = await db.get_playlists(uid)
+        if not playlists:
+            await interaction.response.send_message(
+                embed=Embedder.warning("No Playlists", "Create a playlist first using the Playlists panel."),
+                ephemeral=True,
+            )
+            return
+
+        song = self.favorites[self._selected_idx]
+        view = DashboardFavAddToPlaylistView(self.cog, playlists, song, self.user_id)
+        await interaction.response.send_message(
+            embed=Embedder.standard(
+                "\U0001f4c1 Add to Playlist",
+                f"Select a playlist to add **{song.get('name', 'song')}** to:",
+                footer=BRAND,
+            ),
+            view=view,
+            ephemeral=True,
+        )
+
+    async def _play_all(self, interaction: discord.Interaction) -> None:
         if not self.favorites:
             await interaction.response.send_message("No favorites to play.", ephemeral=True)
             return
@@ -3933,8 +4643,7 @@ class DashboardFavoritesView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="\U0001f500 Shuffle", style=discord.ButtonStyle.primary, row=0)
-    async def shuffle_play_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _shuffle_play(self, interaction: discord.Interaction) -> None:
         if not self.favorites:
             await interaction.response.send_message("No favorites to play.", ephemeral=True)
             return
@@ -3952,8 +4661,7 @@ class DashboardFavoritesView(discord.ui.View):
         except Exception:
             pass
 
-    @discord.ui.button(label="\u2190 Back", style=discord.ButtonStyle.danger, row=1)
-    async def back_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    async def _go_back(self, interaction: discord.Interaction) -> None:
         await self.parent.return_to_main(interaction)
 
 
@@ -4410,7 +5118,9 @@ class MusicDashboardView(discord.ui.View):
     async def autoplay_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         state = self.cog._get_state(self.guild_id)
         state.autoplay = not state.autoplay
-        status = "**ON**" if state.autoplay else "**OFF**"
+        if not state.autoplay:
+            # Remove any auto-queued songs still waiting in the queue
+            state.queue = [s for s in state.queue if not s.get("_autoplay")]
         # Refresh dashboard
         guild = self.cog.bot.get_guild(self.guild_id)
         embed = _dashboard_embed(state, self.cog, guild)
