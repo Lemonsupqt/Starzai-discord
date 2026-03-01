@@ -50,6 +50,7 @@ COGS = [
     "cogs.privacy",
     "cogs.music",
     "cogs.music_premium",
+    "cogs.search",
 ]
 
 

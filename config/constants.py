@@ -17,7 +17,7 @@ MAX_CONTEXT_CHARS = 4000  # Truncation limit per message in context
 STREAMING_EDIT_INTERVAL = 1.5  # Seconds between edits during streaming
 
 # ── Rate Limiting ────────────────────────────────────────────────────
-EXPENSIVE_COMMANDS = {"chat", "ask", "analyze-file", "summarize-file", "analyze-personality"}
+EXPENSIVE_COMMANDS = {"chat", "ask", "analyze-file", "summarize-file", "analyze-personality", "search", "news"}
 EXPENSIVE_RATE_LIMIT = 5  # per minute for expensive commands
 GENERAL_RATE_LIMIT = 10  # per minute for general commands
 
@@ -64,9 +64,15 @@ MAX_HISTORY = 50                            # cap on recently-played songs
 MAX_ENCODER_BITRATE = 512_000               # 512 kbps — discord.py Opus ceiling
 BRAND = "Powered by StarzAI \u26a1"
 
+# ── Web Search ────────────────────────────────────────────────
+WEB_SEARCH_MAX_RESULTS = 5          # max results per search query
+WEB_SEARCH_NEWS_MAX_RESULTS = 8     # more results for news queries
+WEB_SEARCH_CACHE_TTL = 300          # 5-minute cache for repeated queries
+WEB_SEARCH_TIMEOUT = 15             # seconds timeout for web search
+WEB_SEARCH_MAX_SNIPPET_CHARS = 500  # max chars per snippet for LLM context
+
 # ── Music Premium ────────────────────────────────────────────────────
 MAX_PLAYLISTS_PER_USER = 25
 MAX_SONGS_PER_PLAYLIST = 200
 MAX_FAVORITES = 500
 PREMIUM_VIEW_TIMEOUT = 120                  # seconds for premium interactive views
-

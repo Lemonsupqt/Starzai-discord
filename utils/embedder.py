@@ -139,6 +139,40 @@ class Embedder:
         )
 
     @classmethod
+    def searching(cls, query: str = "") -> discord.Embed:
+        """Create a loading embed while web search is in progress."""
+        desc = f"🔍 Searching the web for: **{query}**\n\n⏳ Analyzing results…" if query else "🔍 Searching the web…"
+        return cls._base("🌐 Web Search", desc, BOT_INFO_COLOR, footer="⏳ Searching…")
+
+    @classmethod
+    def search_response(
+        cls,
+        content: str,
+        query: str,
+        sources: str = "",
+        search_type: str = "web",
+        cached: bool = False,
+    ) -> discord.Embed:
+        """Create an embed for an AI-synthesized web search answer."""
+        if len(content) > 3500:
+            content = content[:3494] + "\n…"
+
+        icon = "📰" if search_type == "news" else "🌐"
+        embed = cls._base(
+            f"{icon} {query[:80]}",
+            content,
+            BOT_INFO_COLOR,
+        )
+        if sources:
+            embed.add_field(name="📎 Sources", value=sources[:1024], inline=False)
+        footer_parts = [f"Search: {search_type}"]
+        if cached:
+            footer_parts.append("cached")
+        footer_parts.append(f"✨ {BOT_NAME}")
+        embed.set_footer(text=" • ".join(footer_parts))
+        return embed
+
+    @classmethod
     def paginated(
         cls,
         title: str,
@@ -150,4 +184,3 @@ class Embedder:
         embed = cls._base(title, content, BOT_COLOR)
         embed.set_footer(text=f"Page {page}/{total_pages} • ✨ {BOT_NAME}")
         return embed
-
