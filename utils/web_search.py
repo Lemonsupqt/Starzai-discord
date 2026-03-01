@@ -2,7 +2,7 @@
 Multi-provider web search utility for Starzai.
 
 Provider fallback chain (tries in order, no API key needed for top 2):
-  1. DuckDuckGo  — primary, via duckduckgo-search (text, news, images, videos)
+  1. DuckDuckGo  — primary, via duckduckgo-search DDGS (text, news, images, videos)
   2. Google News RSS — free fallback for news, ultra-fresh, via feedparser
   3. GNews.io API — optional, 100 req/day free (set GNEWS_API_KEY)
   4. CurrentsAPI  — optional, 600 req/day free (set CURRENTS_API_KEY)
@@ -130,9 +130,10 @@ class DuckDuckGoProvider(BaseSearchProvider):
         return True
 
     async def search_web(self, query: str, max_results: int = 5) -> List[SearchResult]:
-        from duckduckgo_search import AsyncDDGS
-        async with AsyncDDGS() as ddgs:
-            raw = await ddgs.atext(query, max_results=max_results)
+        from duckduckgo_search import DDGS
+        raw = await asyncio.to_thread(
+            lambda: DDGS().text(query, max_results=max_results),
+        )
         results = []
         for r in raw or []:
             results.append(SearchResult(
@@ -144,9 +145,10 @@ class DuckDuckGoProvider(BaseSearchProvider):
         return results
 
     async def search_news(self, query: str, max_results: int = 8) -> List[SearchResult]:
-        from duckduckgo_search import AsyncDDGS
-        async with AsyncDDGS() as ddgs:
-            raw = await ddgs.anews(query, max_results=max_results)
+        from duckduckgo_search import DDGS
+        raw = await asyncio.to_thread(
+            lambda: DDGS().news(query, max_results=max_results),
+        )
         results = []
         for r in raw or []:
             results.append(SearchResult(
@@ -160,9 +162,10 @@ class DuckDuckGoProvider(BaseSearchProvider):
         return results
 
     async def search_images(self, query: str, max_results: int = 3) -> List[MediaResult]:
-        from duckduckgo_search import AsyncDDGS
-        async with AsyncDDGS() as ddgs:
-            raw = await ddgs.aimages(query, max_results=max_results)
+        from duckduckgo_search import DDGS
+        raw = await asyncio.to_thread(
+            lambda: DDGS().images(query, max_results=max_results),
+        )
         results = []
         for r in raw or []:
             results.append(MediaResult(
@@ -176,9 +179,10 @@ class DuckDuckGoProvider(BaseSearchProvider):
         return results
 
     async def search_videos(self, query: str, max_results: int = 3) -> List[MediaResult]:
-        from duckduckgo_search import AsyncDDGS
-        async with AsyncDDGS() as ddgs:
-            raw = await ddgs.avideos(query, max_results=max_results)
+        from duckduckgo_search import DDGS
+        raw = await asyncio.to_thread(
+            lambda: DDGS().videos(query, max_results=max_results),
+        )
         results = []
         for r in raw or []:
             # Extract thumbnail from nested images dict
@@ -564,15 +568,30 @@ class WebSearcher:
         return "\n".join(lines)
 
     @staticmethod
-    def format_sources_for_embed(response: SearchResponse, max_sources: int = 5) -> str:
-        """Format source links for display in a Discord embed."""
+    def format_sources_for_embed(
+        response: SearchResponse,
+        max_sources: int = 5,
+        max_length: int = 1024,
+    ) -> str:
+        """Format source links for display in a Discord embed.
+
+        Respects Discord's 1024-char embed field limit by stopping
+        before a line would be cut off mid-text.
+        """
         if not response.has_results:
             return ""
-        lines = []
+        lines: list[str] = []
+        total_len = 0
         for i, r in enumerate(response.results[:max_sources], 1):
             title = r.title[:60] + "…" if len(r.title) > 60 else r.title
             source_tag = f" • {r.source}" if r.source else ""
-            lines.append(f"{i}. [{title}]({r.url}){source_tag}")
+            line = f"{i}. [{title}]({r.url}){source_tag}"
+            # +1 accounts for the "\n" separator between lines
+            added_len = len(line) + (1 if lines else 0)
+            if total_len + added_len > max_length:
+                break
+            lines.append(line)
+            total_len += added_len
         return "\n".join(lines)
 
     @staticmethod
