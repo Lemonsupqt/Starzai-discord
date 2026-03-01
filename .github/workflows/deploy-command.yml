@@ -1,0 +1,81 @@
+name: Slash Command Deploy
+
+# Triggered by commenting /deploy or /deploy main on a PR
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: railway-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy-pr:
+    # Only run on PR comments (not issue comments) that start with /deploy
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/deploy')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse command
+        id: parse
+        run: |
+          COMMENT="${{ github.event.comment.body }}"
+          if [ "$COMMENT" = "/deploy main" ]; then
+            echo "ref=main" >> $GITHUB_OUTPUT
+            echo "label=main" >> $GITHUB_OUTPUT
+          else
+            echo "ref=refs/pull/${{ github.event.issue.number }}/head" >> $GITHUB_OUTPUT
+            echo "label=PR #${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: React to comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'rocket'
+            });
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.parse.outputs.ref }}
+
+      - name: Install Railway CLI
+        run: |
+          bash <(curl -fsSL cli.new) || bash <(curl -fsSL cli.new)
+          echo "$HOME/.railway/bin" >> $GITHUB_PATH
+
+      - name: Deploy to Railway
+        run: railway up --detach --service Starzai-discord
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Comment deploy status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = '${{ steps.parse.outputs.label }}';
+            const sha = '${{ github.sha }}'.substring(0, 7);
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: `✅ **Deployed ${label}** to Railway\n\nCommit: \`${sha}\`\n\n> Use \`/deploy\` to redeploy this PR or \`/deploy main\` to switch back to main`
+            });
+
+      - name: Comment on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              body: '❌ **Deploy failed.** Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.'
+            });
